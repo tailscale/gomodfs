@@ -1,0 +1,4 @@
+github.com/hanwen/go-fuse/v2 v2.7.2 h1:SbJP1sUP+n1UF8NXBA14BuojmTez+mDgOk0bC057HQw=
+github.com/hanwen/go-fuse/v2 v2.7.2/go.mod h1:ugNaD/iv5JYyS1Rcvi57Wz7/vrLQJo10mmketmoef48=
+golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a h1:dGzPydgVsqGcTRVwiLJ1jVbufYwmzD3LfVPLKsKg+0k=
+golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=

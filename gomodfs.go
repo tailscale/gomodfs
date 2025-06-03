@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"log"
 	"os"
@@ -8,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -118,6 +121,7 @@ func gitType(dir, treeHash string, ent string) (string, error) {
 }
 
 var _ fs.NodeLookuper = (*treeNode)(nil)
+var _ fs.NodeReaddirer = (*treeNode)(nil)
 
 func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	typ, err := gitType(n.conf.Git.GitRepo, n.tree, name)
@@ -157,6 +161,56 @@ func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 	log.Printf("Unknown type %q for %q in tree %q", typ, name, n.tree)
 	return nil, syscall.ENOENT
+}
+
+func (n *treeNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	cmd := exec.Command("git", "-C", n.conf.Git.GitRepo, "ls-tree", n.tree)
+	outData, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to list tree %q: %v", n.tree, err)
+		return nil, syscall.EIO
+	}
+
+	var ents []fuse.DirEntry
+	bs := bufio.NewScanner(bytes.NewReader(outData))
+	for bs.Scan() {
+		f := strings.Fields(bs.Text())
+		if len(f) != 4 {
+			log.Printf("Unexpected ls-tree output: %q", bs.Text())
+			continue
+		}
+		modeStr, name := f[0], f[3]
+		// Skip the type in f[1] ("blob", "tree", etc)
+		// Skip the hash in f[2]
+		mode, err := strconv.ParseUint(modeStr, 10, 32)
+		if err != nil {
+			log.Printf("Failed to parse mode %q in ls-tree output: %v", modeStr, err)
+			return nil, syscall.EIO
+		}
+		ents = append(ents, fuse.DirEntry{
+			Name: name,
+			Mode: uint32(mode),
+			Off:  uint64(len(ents)),
+		})
+
+	}
+	if err := bs.Err(); err != nil {
+		log.Printf("Failed to parse ls-tree output: %v", err)
+		return nil, syscall.EIO
+	}
+	return &treeDirStream{ents: ents}, 0
+}
+
+type treeDirStream struct {
+	ents []fuse.DirEntry
+}
+
+func (s *treeDirStream) HasNext() bool { return len(s.ents) > 0 }
+func (s *treeDirStream) Close()        {}
+func (s *treeDirStream) Next() (fuse.DirEntry, syscall.Errno) {
+	ent := s.ents[0]
+	s.ents = s.ents[1:]
+	return ent, 0
 }
 
 // This demonstrates how to build a file system in memory. The

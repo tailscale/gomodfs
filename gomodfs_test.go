@@ -24,7 +24,7 @@ func TestGit(t *testing.T) {
 	d := &modgit.Downloader{GitRepo: "."}
 	conf := &config{Git: d}
 
-	curTree, err := exec.Command("git", "rev-parse", "HEAD^{tree}").CombinedOutput()
+	curTree, err := exec.Command("git", "rev-parse", "HEAD:testdata").CombinedOutput()
 	if err != nil {
 		t.Fatal(err)
 	}

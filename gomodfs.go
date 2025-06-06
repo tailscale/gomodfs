@@ -17,6 +17,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/tailscale/gomodfs/modgit"
+	"go4.org/mem"
 )
 
 type config struct {
@@ -111,10 +112,17 @@ type treeNode struct {
 	tree string
 }
 
+// returns one of "blob", "tree", TODO-link.
+//
+// If ent doesn't exist in treeHash, it returns
+// error os.ErrNotExist.
 func gitType(dir, treeHash string, ent string) (string, error) {
 	cmd := exec.Command("git", "-C", dir, "cat-file", "-t", treeHash+":"+ent)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if mem.Contains(mem.B(out), mem.S("does not exist in")) {
+			return "", os.ErrNotExist
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
@@ -125,8 +133,10 @@ var _ fs.NodeReaddirer = (*treeNode)(nil)
 
 func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	typ, err := gitType(n.conf.Git.GitRepo, n.tree, name)
-	log.Printf("treeNode(%v).Lookup(%q) => %q", n.tree, name, typ)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, syscall.ENOENT
+		}
 		log.Printf("Failed to get type of %q in tree %q: %v", name, n.tree, err)
 		return nil, syscall.EIO
 	}

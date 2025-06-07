@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -178,19 +177,30 @@ func (n *treeNode) initEnts() error {
 		return fmt.Errorf("failed to list tree %q: %w", n.tree, err)
 	}
 
+	gitType := func(t mem.RO) string {
+		if t.EqualString("blob") {
+			return "blob"
+		}
+		if t.EqualString("tree") {
+			return "tree"
+		}
+		return t.StringCopy()
+	}
+
 	ents := []*gitTreeEnt{} // always non-nil
 	bs := bufio.NewScanner(bytes.NewReader(outData))
+	var f []mem.RO
 	for bs.Scan() {
-		f := strings.Fields(bs.Text())
+		f = mem.AppendFields(f[:0], mem.B(bs.Bytes()))
 		if len(f) != 4 {
 			return fmt.Errorf("unexpected ls-tree output: %q", bs.Text())
 		}
-		mode, _ := strconv.ParseUint(f[0], 8, 32)
+		mode, _ := mem.ParseUint(f[0], 8, 32)
 		ents = append(ents, &gitTreeEnt{
 			mode:    uint32(mode),
-			gitType: f[1],
-			ref:     f[2],
-			name:    f[3],
+			gitType: gitType(f[1]),
+			ref:     f[2].StringCopy(),
+			name:    f[3].StringCopy(),
 		})
 	}
 

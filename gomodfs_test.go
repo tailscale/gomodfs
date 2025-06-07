@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
@@ -51,23 +52,47 @@ func TestGit(t *testing.T) {
 		server.Wait()
 	}()
 
-	err = filepath.Walk(tmpMntDir, func(path string, fi os.FileInfo, err error) error {
+	want := walk(t, "testdata")
+	got := walk(t, tmpMntDir)
+	if got != want {
+		t.Fatalf("walk mismatch\n\nGOT:\n%s\nWANT:\n%s", got, want)
+	}
+	t.Logf("got:\n%s", got)
+}
+
+func walk(t testing.TB, dir string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			t.Logf("error walking into %q: %v", path, err)
 			return err
 		}
-		rel, err := filepath.Rel(tmpMntDir, path)
+		rel, err := filepath.Rel(dir, path)
 		if err != nil {
 			return fmt.Errorf("rel: %w", err)
 		}
-		t.Logf("walked: %v, %v", rel, fi.Mode())
-		if fi.Mode().Type()&os.ModeSymlink != 0 {
+		fmt.Fprintf(&buf, "%s", rel)
+		switch {
+		case fi.Mode().IsDir():
+			fmt.Fprintf(&buf, "/, %v\n", fi.Mode())
+		case fi.Mode().IsRegular():
+			v, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(&buf, ", %v, content %q\n", fi.Mode(), v)
+		case fi.Mode().Type()&os.ModeSymlink != 0:
 			target, err := os.Readlink(path)
-			t.Logf("  ReadLink = %q, %v", target, err)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(&buf, " => %q\n", target)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("Walk: %v", err)
 	}
+	return buf.String()
 }

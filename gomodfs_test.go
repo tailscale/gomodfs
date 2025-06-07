@@ -61,6 +61,10 @@ func TestGit(t *testing.T) {
 			return fmt.Errorf("rel: %w", err)
 		}
 		t.Logf("walked: %v, %v", rel, fi.Mode())
+		if fi.Mode().Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			t.Logf("  ReadLink = %q, %v", target, err)
+		}
 		return nil
 	})
 	if err != nil {

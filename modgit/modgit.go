@@ -30,6 +30,14 @@ type Result struct {
 	Downloaded bool
 }
 
+func (d *Downloader) CheckExists() error {
+	out, err := d.git("rev-parse", "--show-toplevel").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%q does not appear to be within a git directory: %v, %s", d.GitRepo, err, out)
+	}
+	return nil
+}
+
 // Get gets a module like "tailscale.com@1.2.43" to the Downloader's
 // git repo, either from cache or by downloading it from the Go module proxy.
 func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, error) {
@@ -215,8 +223,34 @@ func (d *Downloader) client() *http.Client {
 	return cmp.Or(d.Client, http.DefaultClient)
 }
 
+func (d *Downloader) AddBlob(r io.Reader) (hash string, err error) {
+	c := d.git("hash-object", "-w", "--stdin")
+	c.Stdin = r
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to hash object: %w, %s", err, out)
+	}
+	return string(bytes.TrimSpace(out)), nil
+}
+
+func (d *Downloader) AddTreeFromTextFormat(txtTree []byte) (hash string, err error) {
+	c := d.git("mktree")
+	c.Stdin = bytes.NewReader(txtTree)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to mktree: %w: %s\non:\n%s", err, out, txtTree)
+	}
+	return string(bytes.TrimSpace(out)), nil
+
+}
+
 func (d *Downloader) git(args ...string) *exec.Cmd {
-	c := exec.Command("git", args...)
+	allArgs := []string{
+		"-c", "gc.auto=0",
+		"-c", "maintenance.auto=false",
+	}
+	allArgs = append(allArgs, args...)
+	c := exec.Command("git", allArgs...)
 	c.Dir = d.GitRepo
 	return c
 }

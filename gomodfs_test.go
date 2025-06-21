@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -95,4 +96,43 @@ func walk(t testing.TB, dir string) string {
 		t.Fatalf("Walk: %v", err)
 	}
 	return buf.String()
+}
+
+func TestGoModules(t *testing.T) {
+	goModCacheDir := t.TempDir()
+
+	d := &modgit.Downloader{GitRepo: "."}
+	conf := &config{Git: d}
+
+	root := &moduleNameNode{
+		conf: conf,
+	}
+	server, err := fs.Mount(goModCacheDir, root, &fs.Options{
+		MountOptions: fuse.MountOptions{Debug: *debugFUSE},
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+	defer func() {
+		err := server.Unmount()
+		if err != nil {
+			t.Errorf("Unmount error: %v", err)
+		}
+	}()
+	didWait := make(chan struct{})
+	go func() {
+		defer close(didWait)
+		server.Wait()
+	}()
+
+	cmd := exec.Command("go",
+		"install",
+		"--tags=sometag_"+fmt.Sprint(time.Now().UnixNano()),
+		"./testpkg",
+	)
+	cmd.Env = append(os.Environ(), "GOMODCACHE="+goModCacheDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go install failed: %v\n%s", err, out)
+	}
+
 }

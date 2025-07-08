@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
 )
 
 type Downloader struct {
@@ -51,7 +52,9 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 	}
 
 	// See if the ref exists first.
-	out, err := d.git("rev-parse", refName(mod)+"^{tree}").Output()
+	ref := refName(escMod, version)
+	treeRef := ref + "^{tree}"
+	out, err := d.git("rev-parse", treeRef).Output()
 	if err == nil {
 		return &Result{
 			Tree:       strings.TrimSpace(string(out)),
@@ -59,7 +62,8 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 		}, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://proxy.golang.org/"+escMod+"/@v/"+version+".zip", nil)
+	urlStr := "https://proxy.golang.org/" + escMod + "/@v/" + version + ".zip"
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %q: %w", mod, err)
 	}
@@ -75,12 +79,21 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to read %q: %w", mod, err)
 	}
-	log.Printf("Downloaded %d bytes", len(slurp))
+	log.Printf("Downloaded %d bytes from %v", len(slurp), urlStr)
 
-	return d.addToGit(modAtVersion, slurp)
+	return d.addToGit(ref, modAtVersion, slurp)
 }
 
-func (d *Downloader) addToGit(modAtVersion string, data []byte) (*Result, error) {
+func (d *Downloader) GetZipHash(escMod, version string) (string, error) {
+	ref := refName(escMod, version) + "-ziphash"
+	out, err := d.git("cat-file", "-p", ref).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", ref, err, out)
+	}
+	return string(out), nil
+}
+
+func (d *Downloader) addToGit(ref, modAtVersion string, data []byte) (*Result, error) {
 
 	// Unzip data to git
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
@@ -90,7 +103,14 @@ func (d *Downloader) addToGit(modAtVersion string, data []byte) (*Result, error)
 
 	prefix := modAtVersion + "/"
 	tb := newTreeBuilder(d)
+
+	fileNames := make([]string, 0, len(zr.File))
+	zipOfFile := map[string]*zip.File{}
+
 	for _, f := range zr.File {
+		fileNames = append(fileNames, f.Name)
+		zipOfFile[f.Name] = f
+
 		suf := f.Name
 		suf = strings.TrimPrefix(suf, prefix)
 		if err := tb.addFile(suf, f); err != nil {
@@ -99,13 +119,32 @@ func (d *Downloader) addToGit(modAtVersion string, data []byte) (*Result, error)
 		log.Printf("Adding %q to git", suf)
 	}
 
+	zipHash, err := dirhash.Hash1(fileNames, func(name string) (io.ReadCloser, error) {
+		f := zipOfFile[name]
+		if f == nil {
+			return nil, fmt.Errorf("file %q not found in zip", name) // should never happen
+		}
+		return f.Open()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash zip contents: %w", err)
+	}
+	zipHashBlob, err := d.AddBlob(strings.NewReader(zipHash))
+	if err != nil {
+		return nil, fmt.Errorf("failed to add zip hash blob: %w", err)
+	}
+	zipHashRef := ref + "-ziphash"
+	if out, err := d.git("update-ref", zipHashRef, zipHashBlob).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("failed to update ziphash ref %q: %w: %s", zipHashRef, err, out)
+	}
+
 	treeHash, err := tb.buildTree("")
 	if err != nil {
 		return nil, fmt.Errorf("failed to build git tree: %w", err)
 	}
 
-	if out, err := d.git("update-ref", refName(modAtVersion), treeHash).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("failed to update ref %q: %w: %s", modAtVersion, err, out)
+	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
 	}
 
 	return &Result{
@@ -255,6 +294,7 @@ func (d *Downloader) git(args ...string) *exec.Cmd {
 	return c
 }
 
-func refName(module string) string {
-	return "refs/gomod/" + url.PathEscape(module)
+// escModuleName is like "!foo!bar.com" form (for FooBar.com)
+func refName(escModuleName, version string) string {
+	return "refs/gomod/" + url.PathEscape(escModuleName) + "@" + url.PathEscape(version)
 }

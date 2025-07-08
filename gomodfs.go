@@ -4,21 +4,25 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/tailscale/gomodfs/modgit"
 	"go4.org/mem"
+	"golang.org/x/mod/module"
 )
 
 type config struct {
@@ -46,16 +50,23 @@ func (s *moduleNameNode) OnAdd(ctx context.Context) {
 // Node types should implement some file system operations, eg. Lookup
 var _ = (fs.NodeLookuper)((*moduleNameNode)(nil))
 
-var rxCapital = regexp.MustCompile(`\![a-z]`)
-
 func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if len(n.paths) == 0 && name == "cache" {
+		return n.NewInode(ctx, &cacheRootNode{
+			conf: n.conf,
+		}, fs.StableAttr{
+			Mode: fuse.S_IFDIR | 0755,
+		}), 0
+	}
 	if strings.Contains(name, "@") {
-		modName := strings.Join(append(slices.Clone(n.paths), name), "/")
-		modName = rxCapital.ReplaceAllStringFunc(modName, func(in string) string {
-			return strings.ToUpper(in[1:])
-		})
-
-		res, err := n.conf.Git.Get(ctx, modName)
+		finalFrag, ver, _ := strings.Cut(name, "@")
+		escName := strings.Join(n.paths, "/") + "/" + finalFrag
+		modName, err := module.UnescapePath(escName)
+		if err != nil {
+			log.Printf("Failed to unescape module name %q: %v", escName, err)
+			return nil, syscall.EIO
+		}
+		res, err := n.conf.Git.Get(ctx, modName+"@"+ver)
 		if err != nil {
 			log.Printf("Failed to get module %q: %v", modName, err)
 			return nil, syscall.EIO
@@ -289,9 +300,149 @@ func (s *treeDirStream) Next() (fuse.DirEntry, syscall.Errno) {
 	return ent, 0
 }
 
+// cacheRootNode is the $GOMODCACHE/cache directory, containing
+// just a "download" directory within it.
+type cacheRootNode struct {
+	fs.Inode
+	conf *config
+}
+
+func (n *cacheRootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if name != "download" {
+		return nil, syscall.ENOENT
+	}
+	in := n.NewInode(ctx, &cacheDownloadNode{
+		conf: n.conf,
+		segs: nil, // root
+	}, fs.StableAttr{
+		Mode: fuse.S_IFDIR | 0755,
+	})
+	return in, 0
+}
+
+// cacheDownloadNode is a path-segment-building node at or under the
+// $GOMODCACHE/cache/download directory, containing the downloaded modules. It
+// ends when it finds a "/@v/" segment, in which case its module field is set.
+type cacheDownloadNode struct {
+	fs.Inode
+	conf *config
+
+	segs   []string // path segments, e.g. ["!microsoft", "go-winio"] (empty if module is set)
+	module string   // if non-empty, the module name unescaped, e.g. "Microsoft.com/go-winio" (in the /@v/ directory)
+}
+
+func netSlurp(ctx0 context.Context, urlStr string) (_ []byte, err error) {
+	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if err != nil && ctx0.Err() == nil {
+			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %q: %w", urlStr, err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download %q: %s", urlStr, res.Status)
+	}
+	return io.ReadAll(res.Body)
+}
+
+func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.module != "" {
+		// We are in the /@v/ directory, so we should return a file. e.g. one of these:
+		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
+		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.mod
+		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.ziphash
+
+		if strings.HasSuffix(name, ".partial") {
+			return nil, syscall.ENOENT
+		}
+		escPath, err := module.EscapePath(n.module)
+		if err != nil {
+			log.Printf("Failed to escape module name %q: %v", n.module, err)
+			return nil, syscall.EIO
+		}
+
+		if strings.HasSuffix(name, ".mod") || strings.HasSuffix(name, ".info") {
+			slurp, err := netSlurp(ctx, fmt.Sprintf("https://proxy.golang.org/%s/@v/%s", escPath, name))
+			if err != nil {
+				return nil, syscall.EIO
+			}
+			in := n.NewInode(ctx, &memFile{
+				contents: slurp,
+				mode:     0644,
+			}, fs.StableAttr{
+				Mode: fuse.S_IFREG | 0644,
+			})
+			return in, 0
+		}
+
+		if strings.HasSuffix(name, ".ziphash") {
+			d := n.conf.Git
+			if d == nil {
+				log.Printf("No git downloader configured, cannot fetch ziphash for %q", n.module)
+			}
+			version := strings.TrimSuffix(name, ".ziphash") // "v0.0.0-20240501181205-ae6ca9944745"
+			zipHash, err := d.GetZipHash(escPath, version)
+			if err != nil {
+				log.Printf("Failed to get ziphash for %s@%s: %v", n.module, version, err)
+				return nil, syscall.EIO
+			}
+			in := n.NewInode(ctx, &memFile{
+				contents: []byte(zipHash),
+				mode:     0644,
+			}, fs.StableAttr{
+				Mode: fuse.S_IFREG | 0644,
+			})
+			return in, 0
+		}
+
+		log.Printf("TODO: Lookup(%q) in module %q", name, n.module)
+		return nil, syscall.EIO
+	}
+
+	if name == "@v" {
+		unescaped, err := module.UnescapePath(strings.Join(n.segs, "/"))
+		if err != nil {
+			log.Printf("Failed to unescape module name %q: %v", n.segs, err)
+			return nil, syscall.EIO
+		}
+		in := n.NewInode(ctx, &cacheDownloadNode{
+			conf:   n.conf,
+			module: unescaped,
+		}, fs.StableAttr{
+			Mode: fuse.S_IFDIR | 0755,
+		})
+		return in, 0
+	}
+
+	in := n.NewInode(ctx, &cacheDownloadNode{
+		conf: n.conf,
+		segs: append(n.segs[:len(n.segs):len(n.segs)], name),
+	}, fs.StableAttr{
+		Mode: fuse.S_IFDIR | 0755,
+	})
+	return in, 0
+}
+
+var (
+	verbose = flag.Bool("verbose", false, "enable verbose logging")
+)
+
 // This demonstrates how to build a file system in memory. The
 // read/write logic for the file is provided by the MemRegularFile type.
 func main() {
+	flag.Parse()
+
 	gitCache := filepath.Join(os.Getenv("HOME"), ".cache", "gomodfs")
 	if err := os.MkdirAll(gitCache, 0755); err != nil {
 		log.Panicf("Failed to create git cache directory %s: %v", gitCache, err)
@@ -317,7 +468,7 @@ func main() {
 		conf: conf,
 	}
 	server, err := fs.Mount(mntDir, root, &fs.Options{
-		MountOptions: fuse.MountOptions{Debug: true},
+		MountOptions: fuse.MountOptions{Debug: *verbose},
 	})
 	if err != nil {
 		log.Panic(err)

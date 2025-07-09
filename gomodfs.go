@@ -93,9 +93,11 @@ type memFile struct {
 	mode     uint32
 }
 
-var _ = (fs.NodeOpener)((*memFile)(nil))
-var _ = (fs.NodeReader)((*memFile)(nil))
-var _ = (fs.NodeGetattrer)((*memFile)(nil))
+var (
+	_ = (fs.NodeOpener)((*memFile)(nil))
+	_ = (fs.NodeReader)((*memFile)(nil))
+	_ = (fs.NodeGetattrer)((*memFile)(nil))
+)
 
 func (f *memFile) Read(ctx context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	end := int(off) + len(dest)
@@ -307,8 +309,13 @@ type cacheRootNode struct {
 	conf *config
 }
 
+var (
+	_ fs.NodeLookuper = (*cacheRootNode)(nil)
+)
+
 func (n *cacheRootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if name != "download" {
+		log.Printf("Lookup(%q) in cache root, but only 'download' is allowed", name)
 		return nil, syscall.ENOENT
 	}
 	in := n.NewInode(ctx, &cacheDownloadNode{
@@ -331,13 +338,16 @@ type cacheDownloadNode struct {
 	module string   // if non-empty, the module name unescaped, e.g. "Microsoft.com/go-winio" (in the /@v/ directory)
 }
 
-func netSlurp(ctx0 context.Context, urlStr string) (_ []byte, err error) {
+func netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
 	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
 	defer cancel()
 
 	defer func() {
 		if err != nil && ctx0.Err() == nil {
 			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
+		}
+		if err == nil {
+			log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
 		}
 	}()
 
@@ -356,58 +366,13 @@ func netSlurp(ctx0 context.Context, urlStr string) (_ []byte, err error) {
 	return io.ReadAll(res.Body)
 }
 
+var (
+	_ fs.NodeLookuper = (*cacheDownloadNode)(nil)
+)
+
 func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if n.module != "" {
-		// We are in the /@v/ directory, so we should return a file. e.g. one of these:
-		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
-		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.mod
-		// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.ziphash
-
-		if strings.HasSuffix(name, ".partial") {
-			return nil, syscall.ENOENT
-		}
-		escPath, err := module.EscapePath(n.module)
-		if err != nil {
-			log.Printf("Failed to escape module name %q: %v", n.module, err)
-			return nil, syscall.EIO
-		}
-
-		if strings.HasSuffix(name, ".mod") || strings.HasSuffix(name, ".info") {
-			slurp, err := netSlurp(ctx, fmt.Sprintf("https://proxy.golang.org/%s/@v/%s", escPath, name))
-			if err != nil {
-				return nil, syscall.EIO
-			}
-			in := n.NewInode(ctx, &memFile{
-				contents: slurp,
-				mode:     0644,
-			}, fs.StableAttr{
-				Mode: fuse.S_IFREG | 0644,
-			})
-			return in, 0
-		}
-
-		if strings.HasSuffix(name, ".ziphash") {
-			d := n.conf.Git
-			if d == nil {
-				log.Printf("No git downloader configured, cannot fetch ziphash for %q", n.module)
-			}
-			version := strings.TrimSuffix(name, ".ziphash") // "v0.0.0-20240501181205-ae6ca9944745"
-			zipHash, err := d.GetZipHash(escPath, version)
-			if err != nil {
-				log.Printf("Failed to get ziphash for %s@%s: %v", n.module, version, err)
-				return nil, syscall.EIO
-			}
-			in := n.NewInode(ctx, &memFile{
-				contents: []byte(zipHash),
-				mode:     0644,
-			}, fs.StableAttr{
-				Mode: fuse.S_IFREG | 0644,
-			})
-			return in, 0
-		}
-
-		log.Printf("TODO: Lookup(%q) in module %q", name, n.module)
-		return nil, syscall.EIO
+		return n.lookupUnderModule(ctx, name, out)
 	}
 
 	if name == "@v" {
@@ -432,6 +397,63 @@ func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.E
 		Mode: fuse.S_IFDIR | 0755,
 	})
 	return in, 0
+}
+
+// lookupUnderModule is Lookup for a cacheDownloadNode that's hit the /@v/
+// directory, meaning it has a module name set.
+func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	// We are in the /@v/ directory, so we should return a file. e.g. one of these:
+	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
+	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.mod
+	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.ziphash
+
+	if strings.HasSuffix(name, ".partial") {
+		return nil, syscall.ENOENT
+	}
+
+	log.Printf("XXX Lookup(%q) in module %q", name, n.module)
+	escPath, err := module.EscapePath(n.module)
+	if err != nil {
+		log.Printf("Failed to escape module name %q: %v", n.module, err)
+		return nil, syscall.EIO
+	}
+
+	if strings.HasSuffix(name, ".mod") || strings.HasSuffix(name, ".info") {
+		slurp, err := netSlurp(ctx, fmt.Sprintf("https://proxy.golang.org/%s/@v/%s", escPath, name))
+		if err != nil {
+			return nil, syscall.EIO
+		}
+		in := n.NewInode(ctx, &memFile{
+			contents: slurp,
+			mode:     0644,
+		}, fs.StableAttr{
+			Mode: fuse.S_IFREG | 0644,
+		})
+		return in, 0
+	}
+
+	if strings.HasSuffix(name, ".ziphash") {
+		d := n.conf.Git
+		if d == nil {
+			log.Printf("No git downloader configured, cannot fetch ziphash for %q", n.module)
+		}
+		version := strings.TrimSuffix(name, ".ziphash") // "v0.0.0-20240501181205-ae6ca9944745"
+		zipHash, err := d.GetZipHash(escPath, version)
+		if err != nil {
+			log.Printf("Failed to get ziphash for %s@%s: %v", n.module, version, err)
+			return nil, syscall.EIO
+		}
+		in := n.NewInode(ctx, &memFile{
+			contents: []byte(zipHash),
+			mode:     0644,
+		}, fs.StableAttr{
+			Mode: fuse.S_IFREG | 0644,
+		})
+		return in, 0
+	}
+
+	log.Printf("TODO: Lookup(%q) in module %q", name, n.module)
+	return nil, syscall.EIO
 }
 
 var (

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"time"
 
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
@@ -27,7 +28,7 @@ type Downloader struct {
 }
 
 type Result struct {
-	Tree       string // hash of the git tree
+	ModTree    string // hash of the git tree with "zip" tree, "ziphash"/"info"/"mod" files
 	Downloaded bool
 }
 
@@ -57,46 +58,46 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 	out, err := d.git("rev-parse", treeRef).Output()
 	if err == nil {
 		return &Result{
-			Tree:       strings.TrimSpace(string(out)),
+			ModTree:    strings.TrimSpace(string(out)),
 			Downloaded: false,
 		}, nil
 	}
 
-	urlStr := "https://proxy.golang.org/" + escMod + "/@v/" + version + ".zip"
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request for %q: %w", mod, err)
+	exts := map[string][]byte{}
+	for _, ext := range []string{"zip", "info", "mod"} {
+		urlStr := "https://proxy.golang.org/" + escMod + "/@v/" + version + "." + ext
+		data, err := d.netSlurp(ctx, urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+		}
+		exts[ext] = data
+		log.Printf("Downloaded %d bytes from %v", len(data), urlStr)
 	}
-	res, err := d.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download %q: %w", mod, err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download %q: %s", mod, res.Status)
-	}
-	slurp, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %q: %w", mod, err)
-	}
-	log.Printf("Downloaded %d bytes from %v", len(slurp), urlStr)
 
-	return d.addToGit(ref, modAtVersion, slurp)
+	return d.addToGit(ref, modAtVersion, exts)
 }
 
-func (d *Downloader) GetZipHash(escMod, version string) (string, error) {
-	ref := refName(escMod, version) + "-ziphash"
-	out, err := d.git("cat-file", "-p", ref).CombinedOutput()
+func (d *Downloader) GetMetaFile(escMod, version, file string) (string, error) {
+	ref := refName(escMod, version)
+	out, err := d.git("show", ref+":"+file).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", ref, err, out)
+		return "", fmt.Errorf("failed to get %q for %q: %w, %s", file, ref, err, out)
 	}
 	return string(out), nil
 }
 
-func (d *Downloader) addToGit(ref, modAtVersion string, data []byte) (*Result, error) {
+func (d *Downloader) GetZipRootTree(modTreeHash string) (string, error) {
+	out, err := d.git("rev-parse", modTreeHash+":zip").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", modTreeHash, err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {
 
 	// Unzip data to git
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	zr, err := zip.NewReader(bytes.NewReader(parts["zip"]), int64(len(parts["zip"])))
 	if err != nil {
 		return nil, fmt.Errorf("failed to unzip module data: %w", err)
 	}
@@ -111,12 +112,12 @@ func (d *Downloader) addToGit(ref, modAtVersion string, data []byte) (*Result, e
 		fileNames = append(fileNames, f.Name)
 		zipOfFile[f.Name] = f
 
-		suf := f.Name
-		suf = strings.TrimPrefix(suf, prefix)
-		if err := tb.addFile(suf, f); err != nil {
-			return nil, fmt.Errorf("failed to add file %q: %w", suf, err)
+		name := f.Name
+		name = strings.TrimPrefix(name, prefix)
+		if err := tb.addFile("zip/"+name, f.Open, f.Mode()); err != nil {
+			return nil, fmt.Errorf("failed to add file %q: %w", name, err)
 		}
-		log.Printf("Adding %q to git", suf)
+		log.Printf("Adding %q to git", name)
 	}
 
 	zipHash, err := dirhash.Hash1(fileNames, func(name string) (io.ReadCloser, error) {
@@ -129,13 +130,24 @@ func (d *Downloader) addToGit(ref, modAtVersion string, data []byte) (*Result, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash zip contents: %w", err)
 	}
-	zipHashBlob, err := d.AddBlob(strings.NewReader(zipHash))
-	if err != nil {
-		return nil, fmt.Errorf("failed to add zip hash blob: %w", err)
+
+	// Add the metadata files.
+	if err := tb.addFile("ziphash", func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(zipHash)), nil
+	}, 0644); err != nil {
+		return nil, fmt.Errorf("failed to add ziphash file: %w", err)
 	}
-	zipHashRef := ref + "-ziphash"
-	if out, err := d.git("update-ref", zipHashRef, zipHashBlob).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("failed to update ziphash ref %q: %w: %s", zipHashRef, err, out)
+
+	// Add the info and mod files.
+	for name, contents := range parts {
+		if name == "zip" {
+			continue // already added
+		}
+		if err := tb.addFile(name, func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(contents)), nil
+		}, 0644); err != nil {
+			return nil, fmt.Errorf("failed to add file %q: %w", name, err)
+		}
 	}
 
 	treeHash, err := tb.buildTree("")
@@ -148,9 +160,37 @@ func (d *Downloader) addToGit(ref, modAtVersion string, data []byte) (*Result, e
 	}
 
 	return &Result{
-		Tree:       treeHash,
+		ModTree:    treeHash,
 		Downloaded: true,
 	}, nil
+}
+
+func (d *Downloader) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
+	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if err != nil && ctx0.Err() == nil {
+			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
+		}
+		if err == nil {
+			log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %q: %w", urlStr, err)
+	}
+	res, err := d.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download %q: %s", urlStr, res.Status)
+	}
+	return io.ReadAll(res.Body)
 }
 
 type fileInfo struct {
@@ -170,19 +210,19 @@ func newTreeBuilder(d *Downloader) *treeBuilder {
 	}
 }
 
-func (tb *treeBuilder) addFile(suf string, f *zip.File) error {
-	rc, err := f.Open()
+func (tb *treeBuilder) addFile(name string, open func() (io.ReadCloser, error), mode os.FileMode) error {
+	rc, err := open()
 	if err != nil {
-		return fmt.Errorf("failed to open file %q in zip: %w", f.Name, err)
+		return fmt.Errorf("failed to open file %q in zip: %w", name, err)
 	}
 	defer rc.Close()
 	all, err := io.ReadAll(rc)
 	if err != nil {
-		return fmt.Errorf("failed to read file %q in zip: %w", f.Name, err)
+		return fmt.Errorf("failed to read file %q in zip: %w", name, err)
 	}
-	tb.f[suf] = fileInfo{
+	tb.f[name] = fileInfo{
 		contents: all,
-		mode:     f.Mode(),
+		mode:     mode,
 	}
 	return nil
 }

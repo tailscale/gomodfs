@@ -6,9 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -71,9 +68,14 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to get module %q: %v", modName, err)
 			return nil, syscall.EIO
 		}
+		treeHash, err := n.conf.Git.GetZipRootTree(res.ModTree)
+		if err != nil {
+			log.Printf("Failed to get zip root tree for %q (%s): %v", modName, res.ModTree, err)
+			return nil, syscall.EIO
+		}
 		return n.NewInode(ctx, &treeNode{
 			conf: n.conf,
-			tree: res.Tree,
+			tree: treeHash,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFDIR | 0755,
 		}), 0
@@ -227,7 +229,7 @@ func (n *treeNode) initEnts() error {
 
 func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if err := n.initEnts(); err != nil {
-		log.Printf("Lookup(%q) initEnts error: %v", name, err)
+		log.Printf("Lookup(%q) initEnts error in tree %s: %v", name, n.tree, err)
 		return nil, syscall.EIO
 	}
 	ge, ok := n.treeEnt[name]
@@ -338,34 +340,6 @@ type cacheDownloadNode struct {
 	module string   // if non-empty, the module name unescaped, e.g. "Microsoft.com/go-winio" (in the /@v/ directory)
 }
 
-func netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
-	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
-	defer cancel()
-
-	defer func() {
-		if err != nil && ctx0.Err() == nil {
-			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
-		}
-		if err == nil {
-			log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
-		}
-	}()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request for %q: %w", urlStr, err)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download %q: %s", urlStr, res.Status)
-	}
-	return io.ReadAll(res.Body)
-}
-
 var (
 	_ fs.NodeLookuper = (*cacheDownloadNode)(nil)
 )
@@ -411,40 +385,28 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 		return nil, syscall.ENOENT
 	}
 
-	log.Printf("XXX Lookup(%q) in module %q", name, n.module)
 	escPath, err := module.EscapePath(n.module)
 	if err != nil {
 		log.Printf("Failed to escape module name %q: %v", n.module, err)
 		return nil, syscall.EIO
 	}
 
-	if strings.HasSuffix(name, ".mod") || strings.HasSuffix(name, ".info") {
-		slurp, err := netSlurp(ctx, fmt.Sprintf("https://proxy.golang.org/%s/@v/%s", escPath, name))
-		if err != nil {
-			return nil, syscall.EIO
-		}
-		in := n.NewInode(ctx, &memFile{
-			contents: slurp,
-			mode:     0644,
-		}, fs.StableAttr{
-			Mode: fuse.S_IFREG | 0644,
-		})
-		return in, 0
-	}
-
-	if strings.HasSuffix(name, ".ziphash") {
+	dotExt := filepath.Ext(name)
+	switch dotExt {
+	case ".info", ".mod", ".ziphash":
+		ext := dotExt[1:] // "info", "mod", "ziphash"
 		d := n.conf.Git
 		if d == nil {
-			log.Printf("No git downloader configured, cannot fetch ziphash for %q", n.module)
+			log.Printf("No git downloader configured, cannot fetch %s for %q", ext, n.module)
 		}
-		version := strings.TrimSuffix(name, ".ziphash") // "v0.0.0-20240501181205-ae6ca9944745"
-		zipHash, err := d.GetZipHash(escPath, version)
+		version := strings.TrimSuffix(name, dotExt) // "v0.0.0-20240501181205-ae6ca9944745"
+		metaFile, err := d.GetMetaFile(escPath, version, ext)
 		if err != nil {
-			log.Printf("Failed to get ziphash for %s@%s: %v", n.module, version, err)
+			log.Printf("Failed to get %s for %s@%s: %v", ext, n.module, version, err)
 			return nil, syscall.EIO
 		}
 		in := n.NewInode(ctx, &memFile{
-			contents: []byte(zipHash),
+			contents: []byte(metaFile),
 			mode:     0644,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFREG | 0644,

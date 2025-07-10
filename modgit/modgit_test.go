@@ -25,8 +25,8 @@ func TestModgit(t *testing.T) {
 	if !res.Downloaded {
 		t.Fatalf("expected module to be downloaded, got %v", res)
 	}
-	t.Logf("Tree: %s", res.Tree)
+	t.Logf("Tree: %s", res.ModTree)
 
-	out, err := d.git("cat-file", "-p", res.Tree).Output()
+	out, err := d.git("cat-file", "-p", res.ModTree).Output()
 	t.Logf("Got %v:\n%s", err, out)
 }

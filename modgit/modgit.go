@@ -3,11 +3,17 @@ package modgit
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"cmp"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
+	"crypto/sha1"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"maps"
@@ -266,11 +272,32 @@ func (d *Downloader) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, 
 type fileInfo struct {
 	contents []byte
 	mode     os.FileMode
+	gitHash  [sha1.Size]byte
+}
+
+type object struct {
+	typ     string // "blob" or "tree"
+	content []byte // binary contents of the object, after the "<type> <size>\x00" prefix
+}
+
+func (o object) encodedSize() int {
+	n := len(o.content) + len(o.typ)
+	n += 2 // space and '\x00'
+	cl := len(o.content)
+	n++ // at least 1 byte for the length
+	for cl >= 10 {
+		n++
+		cl /= 10
+	}
+	return n
 }
 
 type treeBuilder struct {
 	d *Downloader         // for git commands
 	f map[string]fileInfo // file name to contents
+
+	hashSet map[string]object
+	hashes  []string // hashes in order of addition (dependencies come first)
 }
 
 func newTreeBuilder(d *Downloader) *treeBuilder {
@@ -290,29 +317,44 @@ func (tb *treeBuilder) addFile(name string, open func() (io.ReadCloser, error), 
 	if err != nil {
 		return fmt.Errorf("failed to read file %q in zip: %w", name, err)
 	}
-	tb.f[name] = fileInfo{
+	s1 := sha1.New()
+	fmt.Fprintf(s1, "blob %d\x00", len(all))
+	s1.Write(all)
+
+	fi := fileInfo{
 		contents: all,
 		mode:     mode,
+		gitHash:  [sha1.Size]byte(s1.Sum(nil)),
 	}
+	tb.f[name] = fi
+	tb.addHash(fmt.Sprintf("%02x", fi.gitHash), "blob", all)
 	return nil
+}
+
+// objType is "blob" or "tree".
+// contents is the binary contents of the object, before the "<type> <size>\x00" prefix.
+func (tb *treeBuilder) addHash(hash string, objType string, contents []byte) {
+	if _, ok := tb.hashSet[hash]; ok {
+		return
+	}
+	if tb.hashSet == nil {
+		tb.hashSet = make(map[string]object)
+	}
+	tb.hashSet[hash] = object{typ: objType, content: contents}
+	tb.hashes = append(tb.hashes, hash)
 }
 
 // prefix is "" or "dir/".
 func (tb *treeBuilder) buildTree(dir string) (string, error) {
-	var buf bytes.Buffer // of text tree
+	var buf bytes.Buffer // of binary tree
 
 	ents := tb.dirEnts(dir)
 	for _, ent := range ents {
-		// <mode> <filename>\0<binary object id>
-		typ := "blob"
 		mode := "100644"
 		if ent.isDir {
-			mode = "040000"
-			typ = "tree"
-		} else {
-			if ent.fi.mode&execBits != 0 {
-				mode = "100755"
-			}
+			mode = "40000"
+		} else if ent.fi.mode&execBits != 0 {
+			mode = "100755"
 		}
 		var entHash string
 		if ent.isDir {
@@ -322,24 +364,200 @@ func (tb *treeBuilder) buildTree(dir string) (string, error) {
 				return "", fmt.Errorf("failed to build sub-tree for %q: %w", ent.base, err)
 			}
 		} else {
-			c := tb.d.git("hash-object", "-w", "--stdin")
-			c.Stdin = bytes.NewReader(ent.fi.contents)
-			out, err := c.Output()
-			if err != nil {
-				return "", fmt.Errorf("failed to hash object for %q: %w", ent.base, err)
-			}
-			entHash = string(bytes.TrimSpace(out))
+			entHash = fmt.Sprintf("%02x", ent.fi.gitHash)
 		}
-		fmt.Fprintf(&buf, "%s %s %s\t%s\n", mode, typ, entHash, ent.base)
+		binHash, err := hex.DecodeString(entHash)
+		if err != nil || len(binHash) != sha1.Size {
+			return "", fmt.Errorf("failed to decode hash %q for %q: %w, len=%v", entHash, ent.base, err, len(binHash))
+		}
+		if strings.ContainsAny(ent.base, "\x00/") {
+			return "", fmt.Errorf("invalid file name %q in tree: contains NUL or slash", ent.base)
+		}
+		fmt.Fprintf(&buf, "%s %s\x00%s", mode, ent.base, binHash)
 	}
 
-	c := tb.d.git("mktree")
-	c.Stdin = bytes.NewReader(buf.Bytes())
-	out, err := c.CombinedOutput()
+	s1 := sha1.New()
+	fmt.Fprintf(s1, "tree %d\x00%s", buf.Len(), buf.Bytes())
+	treeHash := fmt.Sprintf("%02x", s1.Sum(nil))
+	tb.addHash(treeHash, "tree", buf.Bytes())
+	return treeHash, nil
+}
+
+type sendToGitStats struct {
+	Trees     int
+	TreeBytes int64
+	Blobs     int
+	BlobBytes int64
+}
+
+// sendToGit sends all trees & blobs to git.
+func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
+	st := &sendToGitStats{}
+	cmd := tb.d.git("cat-file", "--batch-check")
+	cmd.Stdin = strings.NewReader(strings.Join(tb.hashes, "\n") + "\n")
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("failed to mktree: %w: %s\non:\n%s", err, out, buf.Bytes())
+		return nil, fmt.Errorf("error setting up stdout to check existing git objects: %w", err)
 	}
-	return string(bytes.TrimSpace(out)), nil
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start git cat-file: %w", err)
+	}
+	var missing []string
+	bs := bufio.NewScanner(stdout)
+	missingSuffix := []byte(" missing")
+	for bs.Scan() {
+		line := bs.Bytes()
+		hash, ok := bytes.CutSuffix(line, missingSuffix)
+		if !ok {
+			continue
+		}
+		missing = append(missing, string(hash))
+	}
+	if err := bs.Err(); err != nil {
+		cmd.Process.Kill()
+		go cmd.Wait()
+		return nil, fmt.Errorf("failed to read git cat-file output: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("git cat-file command failed: %w", err)
+	}
+	if len(missing) == 0 {
+		return st, nil
+	}
+
+	pw := newPackWriter(len(missing))
+	for _, hash := range missing {
+		obj, ok := tb.hashSet[hash]
+		if !ok {
+			return nil, fmt.Errorf("missing hash %q not found in treeBuilder", hash)
+		}
+		switch obj.typ {
+		case "blob":
+			st.Blobs++
+			st.BlobBytes += int64(len(obj.content))
+		case "tree":
+			st.Trees++
+			st.TreeBytes += int64(len(obj.content))
+		default:
+			return nil, fmt.Errorf("unknown object type %q for hash %q", obj.typ, hash)
+		}
+
+		if err := pw.writePackObject(obj); err != nil {
+			return nil, fmt.Errorf("failed to write pack object for %q: %w", hash, err)
+		}
+		log.Printf("Wrote pack object for %q (%s)", hash, obj.typ)
+	}
+	if err := pw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close pack writer: %w", err)
+	}
+	log.Printf("XXX pack checksum %02x", pw.s1.Sum(nil))
+
+	f, err := os.CreateTemp("", "modgit-pack-*.pack")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp pack file: %w", err)
+	}
+	log.Printf("wrote %q", f.Name())
+
+	cmd = tb.d.git("index-pack", "--stdin", "--fix-thin", "--strict")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = io.TeeReader(bytes.NewReader(pw.buf.Bytes()), f)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("failed to run git index-pack: %w", err)
+	}
+
+	return st, nil
+}
+
+type packWriter struct {
+	s1     hash.Hash
+	closed bool
+	buf    bytes.Buffer
+}
+
+func newPackWriter(numObjs int) *packWriter {
+	pw := &packWriter{
+		s1: sha1.New(),
+	}
+	hdr := make([]byte, 0, 12)
+	hdr = append(hdr, "PACK"...)
+	hdr = binary.BigEndian.AppendUint32(hdr, 2) // version 2
+	hdr = binary.BigEndian.AppendUint32(hdr, uint32(numObjs))
+	pw.Write(hdr)
+	return pw
+}
+
+func (pw *packWriter) writePackObject(obj object) error {
+	hdrBuf := make([]byte, 0, 8)
+	size := obj.encodedSize()
+	const (
+		ObjTree = 2
+		ObjBlob = 3
+	)
+	var typ byte
+	switch obj.typ {
+	case "tree":
+		typ = ObjTree
+	case "blob":
+		typ = ObjBlob
+	default:
+		panic("unreachable")
+	}
+
+	firstSizeBits := size & 0x0F
+	size >>= 4
+
+	firstByte := byte((typ&0x7)<<4) | byte(firstSizeBits)
+	if size != 0 {
+		firstByte |= 0x80 // more bytes follow
+	}
+	hdrBuf = append(hdrBuf, firstByte)
+	for size != 0 {
+		b := byte(size & 0x7F)
+		size >>= 7
+		if size != 0 {
+			b |= 0x80 // more bytes follow
+		}
+		hdrBuf = append(hdrBuf, b)
+	}
+
+	log.Printf("Writing pack object header: type=%s, size=%d, firstByte=%02x, all=% 02x", obj.typ, obj.encodedSize(), firstByte, hdrBuf)
+
+	pw.Write(hdrBuf)
+
+	zw := zlib.NewWriter(pw)
+	if _, err := fmt.Fprintf(zw, "%s %d\x00", obj.typ, len(obj.content)); err != nil {
+		return fmt.Errorf("failed to write pack object header: %w", err)
+	}
+	if _, err := zw.Write(obj.content); err != nil {
+		return fmt.Errorf("failed to write pack object content: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("failed to close zlib writer: %w", err)
+	}
+	return nil
+}
+
+func (pw *packWriter) Close() error {
+	if pw.s1 == nil {
+		return fmt.Errorf("packWriter already closed")
+	}
+	// Write the SHA1 of the pack.
+	pw.buf.Write(pw.s1.Sum(nil))
+	pw.closed = true
+	return nil
+}
+
+func (pw *packWriter) Write(p []byte) (n int, err error) {
+	if pw.closed {
+		return 0, fmt.Errorf("packWriter already closed")
+	}
+	n, err = pw.buf.Write(p)
+	if err != nil {
+		return n, err
+	}
+	pw.s1.Write(p)
+	return n, nil
 }
 
 const execBits = 0111
@@ -359,7 +577,14 @@ func (tb *treeBuilder) dirEnts(prefix string) []dirEnt {
 			continue
 		}
 		base, _, ok := strings.Cut(suf, "/")
-		names[base] = dirEnt{base: base, isDir: ok, fi: fi}
+		newEnt := dirEnt{base: base, isDir: ok, fi: fi}
+		if was, ok := names[base]; ok {
+			if (was.isDir || newEnt.isDir) && (was.isDir != newEnt.isDir) {
+				panic(fmt.Sprintf("unexpected change from %+v to %+v", was, newEnt))
+			}
+		} else {
+			names[base] = newEnt
+		}
 	}
 	ents := slices.Collect(maps.Values(names))
 	slices.SortFunc(ents, func(a, b dirEnt) int {

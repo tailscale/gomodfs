@@ -48,12 +48,44 @@ func (s *moduleNameNode) OnAdd(ctx context.Context) {
 var _ = (fs.NodeLookuper)((*moduleNameNode)(nil))
 
 func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if len(n.paths) == 0 && name == "cache" {
-		return n.NewInode(ctx, &cacheRootNode{
-			conf: n.conf,
-		}, fs.StableAttr{
-			Mode: fuse.S_IFDIR | 0755,
-		}), 0
+	if len(n.paths) == 0 {
+		if name == "cache" {
+			return n.NewInode(ctx, &cacheRootNode{
+				conf: n.conf,
+			}, fs.StableAttr{
+				Mode: fuse.S_IFDIR | 0755,
+			}), 0
+		}
+		// As a special case for Tailscale's needs unrelated to the GOMODCACHE
+		// layout (because I'm too lazy to write a separate FUSE filesystem
+		// that's 95% identical and factor stuff out today), treat a directory
+		// at the top level named "tsgo-$GOOS" as Tailscale's ~/.cache/tsgo/ directory
+		// as expected by ./tool/go.
+		if suf, ok := strings.CutPrefix(name, "tsgo-"); ok {
+			goos, goarch, ok := strings.Cut(suf, "-")
+			if !ok {
+				log.Printf("Invalid tsgo name %q, expected tsgo-$GOOS-$GOARCH", name)
+				return nil, syscall.ENOENT
+			}
+			switch goos {
+			case "linux", "darwin", "windows":
+			default:
+				return nil, syscall.ENOENT
+			}
+			switch goarch {
+			case "amd64", "arm64":
+			default:
+				return nil, syscall.ENOENT
+			}
+			return n.NewInode(ctx, &tsgoRoot{
+				conf:   n.conf,
+				goos:   goos,
+				goarch: goarch,
+			}, fs.StableAttr{
+				Mode: fuse.S_IFDIR | 0755,
+			}), 0
+		}
+
 	}
 	if strings.Contains(name, "@") {
 		finalFrag, ver, _ := strings.Cut(name, "@")

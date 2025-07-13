@@ -1,9 +1,11 @@
 package modgit
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"cmp"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -92,6 +95,73 @@ func (d *Downloader) GetZipRootTree(modTreeHash string) (string, error) {
 		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", modTreeHash, err, out)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+var wordRx = regexp.MustCompile(`^\w+$`)
+
+// TreeOfRef returns the tree hash of the given ref, or ("", false) if it
+// doesn't exist.
+func (d *Downloader) GetTailscaleGo(goos, goarch, commit string) (tree string, err error) {
+	for _, v := range []string{goos, goarch, commit} {
+		if !wordRx.MatchString(v) {
+			return "", fmt.Errorf("invalid value %q", v)
+		}
+	}
+
+	ref := fmt.Sprintf("refs/tsgo-%s-%s-%s", goos, goarch, commit)
+
+	// See if the ref exists first.
+	out, err := d.git("rev-parse", ref+"^{tree}").CombinedOutput()
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+
+	// If it doesn't exist, download the tarball.
+	urlStr := fmt.Sprintf("https://github.com/tailscale/go/releases/download/build-%s/%s-%s.tar.gz", commit, goos, goarch)
+	log.Printf("Downloading %q", urlStr)
+	data, err := d.netSlurp(context.Background(), urlStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to download %q: %w", urlStr, err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("failed to gunzip tarball: %w", err)
+	}
+
+	tb := newTreeBuilder(d)
+
+	tr := tar.NewReader(zr)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break // end of tar
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to read tar header: %w", err)
+		}
+		if h.FileInfo().IsDir() {
+			continue
+		}
+		name := strings.TrimPrefix(h.Name, "go/")
+		if err := tb.addFile(name, func() (io.ReadCloser, error) {
+			return io.NopCloser(tr), nil
+		}, h.FileInfo().Mode()); err != nil {
+			return "", fmt.Errorf("failed to add file %q from tar: %w", h.Name, err)
+		}
+		log.Printf("added %q to git tree", name)
+	}
+	log.Printf("building git tree ....")
+	treeHash, err := tb.buildTree("")
+	if err != nil {
+		log.Printf("git tree build error for %v: %v", ref, err)
+		return "", fmt.Errorf("failed to build git tree: %w", err)
+	}
+
+	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
+	}
+
+	return treeHash, nil
 }
 
 func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {

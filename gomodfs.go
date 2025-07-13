@@ -161,22 +161,6 @@ type gitTreeEnt struct {
 	// 120000 blob 996f1789ff67c0e3f69ef5933a55d54c5d0e9954    some-symlink
 }
 
-// returns one of "blob", "tree", TODO-link.
-//
-// If ent doesn't exist in treeHash, it returns
-// error os.ErrNotExist.
-func gitType(dir, treeHash string, ent string) (string, error) {
-	cmd := exec.Command("git", "-C", dir, "cat-file", "-t", treeHash+":"+ent)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if mem.Contains(mem.B(out), mem.S("does not exist in")) {
-			return "", os.ErrNotExist
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 var _ fs.NodeLookuper = (*treeNode)(nil)
 var _ fs.NodeReaddirer = (*treeNode)(nil)
 

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestModgit(t *testing.T) {
@@ -37,6 +38,12 @@ func TestModgit(t *testing.T) {
 
 func TestTreeBuilder(t *testing.T) {
 	gitDir := t.TempDir()
+	defer func() {
+		if t.Failed() {
+			t.Logf("Sleeping for 5m... to allow inspection of %s", gitDir)
+			time.Sleep(5 * time.Minute)
+		}
+	}()
 
 	var d Downloader
 	d.GitRepo = gitDir

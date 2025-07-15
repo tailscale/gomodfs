@@ -9,7 +9,6 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -22,15 +21,11 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/packfile"
-	objectpkg "github.com/go-git/go-git/v5/plumbing/object"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 )
@@ -447,10 +442,8 @@ func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 		return st, nil
 	}
 
-	genPack := os.Getenv("MODGIT_GEN_PACK") == "1" // whether to write a pack file
-	genLoose := os.Getenv("MODGIT_GEN_LOOSE") == "1" || !genPack
-
 	pw := newPackWriter(len(missing))
+
 	for _, hash := range missing {
 		obj, ok := tb.hashSet[hash]
 		if !ok {
@@ -467,126 +460,24 @@ func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 			return nil, fmt.Errorf("unknown object type %q for hash %q", obj.typ, hash)
 		}
 
-		if genLoose {
-			dstFile := filepath.Join(tb.d.GitRepo, ".git", "objects", hash[:2], hash[2:])
-			if err := os.MkdirAll(filepath.Dir(dstFile), 0755); err != nil {
-				return nil, fmt.Errorf("failed to create directory for %q: %w", dstFile, err)
-			}
-			if _, err := os.Stat(dstFile); err == nil {
-				log.Printf("Object %q already exists, not writing loose file", hash)
-			} else {
-				rndBuf := make([]byte, 8)
-				if _, err := io.ReadFull(rand.Reader, rndBuf); err != nil {
-					return nil, fmt.Errorf("failed to read random bytes for temp file: %w", err)
-				}
-				tmpFile := dstFile + ".tmp" + fmt.Sprintf("%02x", rndBuf)
-
-				var zbuf bytes.Buffer
-				zw := zlib.NewWriter(&zbuf)
-				fmt.Fprintf(zw, "%s %d\x00%s", obj.typ, len(obj.content), obj.content)
-				zw.Close()
-
-				if err := os.WriteFile(tmpFile, zbuf.Bytes(), 0644); err != nil {
-					return nil, fmt.Errorf("failed to write temp file %q: %w", tmpFile, err)
-				}
-				if err := os.Rename(tmpFile, dstFile); err != nil {
-					return nil, fmt.Errorf("failed to rename temp file %q to %q: %w", tmpFile, dstFile, err)
-				}
-			}
-		}
-
-		if genPack {
-			if err := pw.writePackObject(obj); err != nil {
-				return nil, fmt.Errorf("failed to write pack object for %q: %w", hash, err)
-			}
-			log.Printf("Wrote pack object for %q (%s)", hash, obj.typ)
+		if err := pw.writePackObject(obj); err != nil {
+			return nil, fmt.Errorf("failed to write pack object for %q: %w", hash, err)
 		}
 	}
 
-	if genPack {
-		if err := pw.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close pack writer: %w", err)
-		}
-		log.Printf("XXX pack checksum %02x", pw.s1.Sum(nil))
+	if err := pw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close pack writer: %w", err)
+	}
 
-		f, err := os.CreateTemp("", "modgit-pack-*.pack")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temp pack file: %w", err)
-		}
-		log.Printf("wrote %q", f.Name())
-		f.Write(pw.buf.Bytes())
-		f.Close()
+	packFile := pw.buf.Bytes()
 
-		if err := dumpPackfile(bytes.NewReader(pw.buf.Bytes())); err != nil {
-			log.Printf("failed to dump packfile: %v", err)
-		}
-
-		cmd = tb.d.git("index-pack", "--stdin", "--fix-thin", "--strict")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = bytes.NewReader(pw.buf.Bytes())
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("failed to run git index-pack: %w", err)
-		}
+	cmd = tb.d.git("index-pack", "--stdin", "--fix-thin", "--strict")
+	cmd.Stdin = bytes.NewReader(packFile)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("failed to run git index-pack: %w, %s", err, out)
 	}
 
 	return st, nil
-}
-
-func dumpPackfile(r io.Reader) error {
-	sc := packfile.NewScanner(r)
-	version, objects, err := sc.Header()
-	if err != nil {
-		return fmt.Errorf("failed to read packfile header: %w", err)
-	}
-	log.Printf("packfile version %d, %d objects", version, objects)
-	n := 0
-	for {
-		oh, err := sc.NextObjectHeader()
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("end of packfile reached after %d/%d objects", n, objects)
-				break // end of packfile
-			}
-			return fmt.Errorf("failed to read next object header: %w", err)
-		}
-		rc, err := sc.ReadObject()
-		if err != nil {
-			return fmt.Errorf("failed to read object %d: %w", n, err)
-		}
-		all, err := io.ReadAll(rc)
-		if err != nil {
-			return fmt.Errorf("failed to read object %d content: %w", n, err)
-		}
-		hash := sha1.Sum(all)
-
-		log.Printf(" pack[%d]: ref=%02x, type=%s, size=%d, offset=%d", n, hash, oh.Type, oh.Length, oh.Offset)
-		n++
-
-		if oh.Type == plumbing.TreeObject {
-			log.Printf("  tree object % 02x", all)
-			var t objectpkg.Tree
-			if err := t.Decode(encodedObject{b: all}); err != nil {
-				log.Printf("  tree decode error: %v", err)
-			} else {
-				log.Printf("  tree %s, %d entries", t.Hash, len(t.Entries))
-				for _, entry := range t.Entries {
-					log.Printf("    %s %s", entry.Name, entry.Hash)
-				}
-			}
-
-		}
-
-		if uint32(n) == objects {
-			break
-		}
-	}
-	sum, err := sc.Checksum()
-	if err != nil {
-		return fmt.Errorf("failed to read packfile checksum: %w", err)
-	}
-	log.Printf("packfile checksum: %v", sum)
-	return nil
 }
 
 type packWriter struct {
@@ -610,6 +501,7 @@ func newPackWriter(numObjs int) *packWriter {
 func (pw *packWriter) writePackObject(obj object) error {
 	hdrBuf := make([]byte, 0, 8)
 	size := obj.encodedSize()
+	size = len(obj.content) // XXX
 	const (
 		ObjTree = 2
 		ObjBlob = 3
@@ -641,14 +533,9 @@ func (pw *packWriter) writePackObject(obj object) error {
 		hdrBuf = append(hdrBuf, b)
 	}
 
-	log.Printf("Writing pack object header: type=%s, size=%d,  all=% 02x", obj.typ, obj.encodedSize(), hdrBuf)
-
 	pw.Write(hdrBuf)
 
 	zw := zlib.NewWriter(pw)
-	if _, err := fmt.Fprintf(zw, "%s %d\x00", obj.typ, len(obj.content)); err != nil {
-		return fmt.Errorf("failed to write pack object header: %w", err)
-	}
 	if _, err := zw.Write(obj.content); err != nil {
 		return fmt.Errorf("failed to write pack object content: %w", err)
 	}
@@ -752,44 +639,4 @@ func (d *Downloader) git(args ...string) *exec.Cmd {
 // escModuleName is like "!foo!bar.com" form (for FooBar.com)
 func refName(escModuleName, version string) string {
 	return "refs/gomod/" + url.PathEscape(escModuleName) + "@" + url.PathEscape(version)
-}
-
-type encodedObject struct {
-	plumbing.EncodedObject
-	b []byte // binary contents of the object, after the "<type> <size>\x00" prefix
-}
-
-func (eo encodedObject) Type() plumbing.ObjectType {
-	if len(eo.b) < 1 {
-		return plumbing.InvalidObject
-	}
-	switch eo.b[0] {
-	case 'b':
-		return plumbing.BlobObject
-	case 't':
-		return plumbing.TreeObject
-	case 'c':
-		return plumbing.CommitObject
-	case 'o':
-		return plumbing.TagObject
-	default:
-		return plumbing.InvalidObject
-	}
-}
-
-func (eo encodedObject) Hash() plumbing.Hash {
-	if len(eo.b) < 1 {
-		return plumbing.ZeroHash
-	}
-	h := sha1.Sum(eo.b)
-	return plumbing.NewHash(hex.EncodeToString(h[:]))
-}
-
-func (eo encodedObject) Size() int64 {
-	return int64(len(eo.b))
-}
-
-func (eo encodedObject) Reader() (io.ReadCloser, error) {
-	_, pay, _ := bytes.Cut(eo.b, []byte{'\x00'})
-	return io.NopCloser(bytes.NewReader(pay)), nil
 }

@@ -100,22 +100,68 @@ func walk(t testing.TB, dir string) string {
 
 func TestGoModules(t *testing.T) {
 
-	type pathAndContents struct {
-		path string
-		want string
+	type testEnv struct {
+		*testing.T
+		mnt string
+	}
+
+	type checker func(t testEnv) error
+	pathContents := func(path, want string) checker {
+		return func(t testEnv) error {
+			got, err := os.ReadFile(filepath.Join(t.mnt, path))
+			if err != nil {
+				return err
+			}
+			if string(got) != want {
+				return fmt.Errorf("unexpected content for %q: got %q, want %q", path, got, want)
+			}
+			return nil
+		}
+	}
+	fileSize := func(path string, wantSize int64) checker {
+		return func(t testEnv) error {
+			fi, err := os.Stat(filepath.Join(t.mnt, path))
+			if err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				return fmt.Errorf("expected file %q to be a regular file, but it is a directory", path)
+			}
+			if fi.Size() != wantSize {
+				return fmt.Errorf("unexpected size for %q: got %d, want %d", path, fi.Size(), wantSize)
+			}
+			return nil
+		}
 	}
 
 	tests := []struct {
 		name   string
-		checks []pathAndContents
+		checks []checker
 	}{
 		{
-			name: "cache-mod-first",
-			checks: []pathAndContents{
-				{
-					path: "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.mod",
-					want: "module go4.org/mem\n\ngo 1.14\n",
-				},
+			name: "hit-cache-dir-first",
+			checks: []checker{
+				pathContents(
+					"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.mod",
+					"module go4.org/mem\n\ngo 1.14\n",
+				),
+				fileSize(
+					"go4.org/mem@v0.0.0-20240501181205-ae6ca9944745/mem.go",
+					12195,
+				),
+			},
+		},
+		{
+			name: "hit-file-dir-first",
+			checks: []checker{
+				fileSize(
+					"go4.org/mem@v0.0.0-20240501181205-ae6ca9944745/mem.go",
+					12195,
+				),
+				pathContents(
+					"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.mod",
+					"module go4.org/mem\n\ngo 1.14\n",
+				),
 			},
 		},
 	}
@@ -154,13 +200,14 @@ func TestGoModules(t *testing.T) {
 				server.Wait()
 			}()
 
-			for _, check := range tt.checks {
-				got, err := os.ReadFile(filepath.Join(goModCacheDir, check.path))
-				if err != nil {
-					t.Fatalf("ReadFile(%q) failed: %v", check.path, err)
+			for i, check := range tt.checks {
+				env := testEnv{
+					T:   t,
+					mnt: goModCacheDir,
+					// TODO: stats on HTTP faults
 				}
-				if string(got) != check.want {
-					t.Errorf("unexpected content for %q: got %q, want %q", check.path, got, check.want)
+				if err := check(env); err != nil {
+					t.Errorf("check[%d]: %v", i, err)
 				}
 			}
 		})

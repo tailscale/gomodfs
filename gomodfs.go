@@ -413,12 +413,23 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 		ext := dotExt[1:] // "info", "mod", "ziphash"
 		d := n.conf.Git
 		if d == nil {
-			log.Printf("No git downloader configured, cannot fetch %s for %q", ext, n.module)
+			log.Printf("No git repo configured, cannot resolve %s for %q", ext, n.module)
+			return nil, syscall.EIO
 		}
 		version := strings.TrimSuffix(name, dotExt) // "v0.0.0-20240501181205-ae6ca9944745"
+
+		// In case the module isn't downloaded yet, Get it for the side
+		// effect of downloading it and populating all the refs.
+		getRes, getErr := n.conf.Git.Get(ctx, n.module+"@"+version)
+
 		metaFile, err := d.GetMetaFile(escPath, version, ext)
 		if err != nil {
 			log.Printf("Failed to get %s for %s@%s: %v", ext, n.module, version, err)
+			if getErr != nil {
+				log.Printf("Also failed to earlier download %s@%s: %v", n.module, version, getErr)
+			} else {
+				log.Printf("Module %s@%s is %+v", n.module, version, getRes)
+			}
 			return nil, syscall.EIO
 		}
 		in := n.NewInode(ctx, &memFile{

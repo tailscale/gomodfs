@@ -39,6 +39,11 @@ type Downloader struct {
 	Client *http.Client // or nil to use default client
 
 	GitRepo string
+
+	// ModuleProxyURL is the URL of the Go module proxy to use.
+	// If empty, "https://proxy.golang.org" is used.
+	// It should not have a trailing slash.
+	ModuleProxyURL string
 }
 
 type Result struct {
@@ -52,6 +57,13 @@ func (d *Downloader) CheckExists() error {
 		return fmt.Errorf("%q does not appear to be within a git directory: %v, %s", d.GitRepo, err, out)
 	}
 	return nil
+}
+
+func (d *Downloader) moduleProxyURL() string {
+	if d.ModuleProxyURL != "" {
+		return strings.TrimSuffix(d.ModuleProxyURL, "/")
+	}
+	return "https://proxy.golang.org"
 }
 
 // Get gets a module like "tailscale.com@1.2.43" to the Downloader's
@@ -79,7 +91,7 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 
 	exts := map[string][]byte{}
 	for _, ext := range []string{"zip", "info", "mod"} {
-		urlStr := "https://proxy.golang.org/" + escMod + "/@v/" + version + "." + ext
+		urlStr := d.moduleProxyURL() + "/" + escMod + "/@v/" + version + "." + ext
 		data, err := d.netSlurp(ctx, urlStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
@@ -161,11 +173,13 @@ func (d *Downloader) GetTailscaleGo(goos, goarch, commit string) (tree string, e
 		}
 		log.Printf("added %q to git tree", name)
 	}
-	log.Printf("building git tree ....")
 	treeHash, err := tb.buildTree("")
 	if err != nil {
 		log.Printf("git tree build error for %v: %v", ref, err)
 		return "", fmt.Errorf("failed to build git tree: %w", err)
+	}
+	if _, err := tb.sendToGit(); err != nil {
+		log.Printf("git sendToGit error for %v: %v", ref, err)
 	}
 
 	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
@@ -234,6 +248,9 @@ func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte)
 	treeHash, err := tb.buildTree("")
 	if err != nil {
 		return nil, fmt.Errorf("failed to build git tree: %w", err)
+	}
+	if _, err := tb.sendToGit(); err != nil {
+		log.Printf("git sendToGit error for %v: %v", ref, err)
 	}
 
 	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {

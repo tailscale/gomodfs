@@ -99,40 +99,71 @@ func walk(t testing.TB, dir string) string {
 }
 
 func TestGoModules(t *testing.T) {
-	goModCacheDir := t.TempDir()
 
-	d := &modgit.Downloader{GitRepo: "."}
-	conf := &config{Git: d}
-
-	root := &moduleNameNode{
-		conf: conf,
+	type pathAndContents struct {
+		path string
+		want string
 	}
-	server, err := fs.Mount(goModCacheDir, root, &fs.Options{
-		MountOptions: fuse.MountOptions{Debug: *debugFUSE},
-	})
-	if err != nil {
-		log.Panic(err)
-	}
-	defer func() {
-		err := server.Unmount()
-		if err != nil {
-			t.Errorf("Unmount error: %v", err)
-		}
-	}()
-	didWait := make(chan struct{})
-	go func() {
-		defer close(didWait)
-		server.Wait()
-	}()
 
-	cmd := exec.Command("go",
-		"install",
-		"--tags=sometag_"+fmt.Sprint(time.Now().UnixNano()),
-		"./testpkg",
-	)
-	cmd.Env = append(os.Environ(), "GOMODCACHE="+goModCacheDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go install failed: %v\n%s", err, out)
+	tests := []struct {
+		name   string
+		checks []pathAndContents
+	}{
+		{
+			name: "cache-mod-first",
+			checks: []pathAndContents{
+				{
+					path: "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.mod",
+					want: "module go4.org/mem\n\ngo 1.14\n",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			goModCacheDir := t.TempDir()
+			t.Logf("mount: %v", goModCacheDir)
+
+			d := &modgit.Downloader{GitRepo: "."}
+			conf := &config{Git: d}
+
+			root := &moduleNameNode{
+				conf: conf,
+			}
+			server, err := fs.Mount(goModCacheDir, root, &fs.Options{
+				MountOptions: fuse.MountOptions{Debug: *debugFUSE},
+			})
+			if err != nil {
+				t.Fatalf("Mount: %v", err)
+			}
+			defer func() {
+				err := server.Unmount()
+				if err != nil {
+					t.Errorf("Unmount error: %v", err)
+				}
+				if t.Failed() {
+					t.Logf("Sleeping for 5m... to allow inspection of %s", goModCacheDir)
+					time.Sleep(5 * time.Minute)
+				}
+			}()
+			didWait := make(chan struct{})
+			go func() {
+				defer close(didWait)
+				server.Wait()
+			}()
+
+			for _, check := range tt.checks {
+				got, err := os.ReadFile(filepath.Join(goModCacheDir, check.path))
+				if err != nil {
+					t.Fatalf("ReadFile(%q) failed: %v", check.path, err)
+				}
+				if string(got) != check.want {
+					t.Errorf("unexpected content for %q: got %q, want %q", check.path, got, check.want)
+				}
+			}
+		})
 	}
 
 }

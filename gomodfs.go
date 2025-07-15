@@ -89,7 +89,12 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 	}
 	if strings.Contains(name, "@") {
 		finalFrag, ver, _ := strings.Cut(name, "@")
-		escName := strings.Join(n.paths, "/") + "/" + finalFrag
+		var escName string
+		if len(n.paths) > 0 {
+			escName = strings.Join(n.paths, "/") + "/" + finalFrag
+		} else {
+			escName = finalFrag
+		}
 		modName, err := module.UnescapePath(escName)
 		if err != nil {
 			log.Printf("Failed to unescape module name %q: %v", escName, err)

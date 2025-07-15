@@ -164,6 +164,15 @@ func TestGoModules(t *testing.T) {
 				),
 			},
 		},
+		{
+			name: "module-without-slash",
+			checks: []checker{
+				fileSize(
+					"gocloud.dev@v0.20.0/blob/fileblob/example_test.go",
+					2137,
+				),
+			},
+		},
 	}
 
 	for _, tt := range tests {

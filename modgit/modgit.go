@@ -297,18 +297,6 @@ type object struct {
 	content []byte // binary contents of the object, after the "<type> <size>\x00" prefix
 }
 
-func (o object) encodedSize() int {
-	n := len(o.content) + len(o.typ)
-	n += 2 // space and '\x00'
-	cl := len(o.content)
-	n++ // at least 1 byte for the length
-	for cl >= 10 {
-		n++
-		cl /= 10
-	}
-	return n
-}
-
 type treeBuilder struct {
 	d *Downloader         // for git commands
 	f map[string]fileInfo // file name to contents
@@ -500,8 +488,7 @@ func newPackWriter(numObjs int) *packWriter {
 
 func (pw *packWriter) writePackObject(obj object) error {
 	hdrBuf := make([]byte, 0, 8)
-	size := obj.encodedSize()
-	size = len(obj.content) // XXX
+	size := len(obj.content) // XXX
 	const (
 		ObjTree = 2
 		ObjBlob = 3
@@ -519,16 +506,18 @@ func (pw *packWriter) writePackObject(obj object) error {
 	firstSizeBits := size & 0x0F
 	size >>= 4
 
+	const continueBit = uint8(0x80) // if set, more bytes follow
+
 	firstByte := byte((typ&0x7)<<4) | byte(firstSizeBits)
 	if size != 0 {
-		firstByte |= 0x80 // more bytes follow
+		firstByte |= continueBit
 	}
 	hdrBuf = append(hdrBuf, firstByte)
 	for size != 0 {
 		b := byte(size & 0x7F)
 		size >>= 7
 		if size != 0 {
-			b |= 0x80 // more bytes follow
+			b |= continueBit
 		}
 		hdrBuf = append(hdrBuf, b)
 	}

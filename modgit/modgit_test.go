@@ -99,17 +99,3 @@ func TestTreeBuilder(t *testing.T) {
 		}
 	}
 }
-
-func TestObject(t *testing.T) {
-	buf := make([]byte, 10002)
-	wantBuf := make([]byte, 20)
-	for size := 0; size <= len(buf); size++ {
-		o := object{"blob", buf[:size]}
-		got := o.encodedSize()
-		wantHdr := fmt.Appendf(wantBuf[:0], "%s %d\x00", o.typ, size)
-		want := len(wantHdr) + size
-		if got != want {
-			t.Errorf("object.encodedSize() = %d, want %d for size %d", got, want, size)
-		}
-	}
-}

@@ -24,7 +24,7 @@ import (
 	"golang.org/x/mod/module"
 )
 
-type config struct {
+type FS struct {
 	Git   *modgit.Downloader // or nil to use default client
 	Stats Stats
 }
@@ -89,7 +89,7 @@ func (s *ActiveSpan) End(err error) {
 type moduleNameNode struct {
 	fs.Inode
 	paths []string
-	conf  *config
+	fs    *FS
 
 	didInit bool
 }
@@ -110,7 +110,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 	if len(n.paths) == 0 {
 		if name == "cache" {
 			return n.NewInode(ctx, &cacheRootNode{
-				conf: n.conf,
+				fs: n.fs,
 			}, fs.StableAttr{
 				Mode: fuse.S_IFDIR | 0755,
 			}), 0
@@ -137,7 +137,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 				return nil, syscall.ENOENT
 			}
 			return n.NewInode(ctx, &tsgoRoot{
-				conf:   n.conf,
+				conf:   n.fs,
 				goos:   goos,
 				goarch: goarch,
 			}, fs.StableAttr{
@@ -159,15 +159,15 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to unescape module name %q: %v", escName, err)
 			return nil, syscall.EIO
 		}
-		span := n.conf.Stats.StartSpan("module-name-get-repo")
-		res, err := n.conf.Git.Get(ctx, modName+"@"+ver)
+		span := n.fs.Stats.StartSpan("module-name-get-repo")
+		res, err := n.fs.Git.Get(ctx, modName+"@"+ver)
 		span.End(err)
 		if err != nil {
 			log.Printf("Failed to get module %q: %v", modName, err)
 			return nil, syscall.EIO
 		}
-		zipSpan := n.conf.Stats.StartSpan("getZipRoot")
-		treeHash, err := n.conf.Git.GetZipRootTree(res.ModTree)
+		zipSpan := n.fs.Stats.StartSpan("getZipRoot")
+		treeHash, err := n.fs.Git.GetZipRootTree(res.ModTree)
 		zipSpan.End(err)
 		if err != nil {
 			log.Printf("Failed to get zip root tree for %q (%s): %v", modName, res.ModTree, err)
@@ -175,14 +175,14 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 		}
 		log.Printf("lookup tree: mod=%s ver=%v tree=%v", modName, ver, treeHash)
 		return n.NewInode(ctx, &treeNode{
-			conf: n.conf,
+			fs:   n.fs,
 			tree: treeHash,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFDIR | 0755,
 		}), 0
 	}
 	in := n.Inode.NewInode(ctx, &moduleNameNode{
-		conf:  n.conf,
+		fs:    n.fs,
 		paths: append(slices.Clone(n.paths), name),
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,
@@ -244,7 +244,7 @@ func (f *symLink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 
 type treeNode struct {
 	fs.Inode
-	conf *config
+	fs   *FS
 	tree string
 
 	mu       sync.Mutex
@@ -272,8 +272,8 @@ func (n *treeNode) initEnts() error {
 		return nil
 	}
 
-	span := n.conf.Stats.StartSpan("ls-tree")
-	cmd := exec.Command("git", "-C", n.conf.Git.GitRepo, "ls-tree", n.tree)
+	span := n.fs.Stats.StartSpan("ls-tree")
+	cmd := exec.Command("git", "-C", n.fs.Git.GitRepo, "ls-tree", n.tree)
 	outData, err := cmd.CombinedOutput()
 	span.End(err)
 	if err != nil {
@@ -331,8 +331,8 @@ func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 	switch ge.gitType {
 	case "blob":
-		span := n.conf.Stats.StartSpan("blob-cat-file")
-		cmd := exec.Command("git", "-C", n.conf.Git.GitRepo, "cat-file", "-p", ge.ref)
+		span := n.fs.Stats.StartSpan("blob-cat-file")
+		cmd := exec.Command("git", "-C", n.fs.Git.GitRepo, "cat-file", "-p", ge.ref)
 		outData, err := cmd.CombinedOutput()
 		span.End(err)
 		if err != nil {
@@ -360,7 +360,7 @@ func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		return n.Inode.NewInode(ctx, node, fs.StableAttr{Mode: mode}), 0
 	case "tree":
 		return n.Inode.NewInode(ctx, &treeNode{
-			conf: n.conf,
+			fs:   n.fs,
 			tree: ge.ref,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFDIR | 0755,
@@ -403,7 +403,7 @@ func (s *treeDirStream) Next() (fuse.DirEntry, syscall.Errno) {
 // just a "download" directory within it.
 type cacheRootNode struct {
 	fs.Inode
-	conf *config
+	fs *FS
 }
 
 var (
@@ -416,7 +416,7 @@ func (n *cacheRootNode) Lookup(ctx context.Context, name string, out *fuse.Entry
 		return nil, syscall.ENOENT
 	}
 	in := n.NewInode(ctx, &cacheDownloadNode{
-		conf: n.conf,
+		fs:   n.fs,
 		segs: nil, // root
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,
@@ -429,7 +429,7 @@ func (n *cacheRootNode) Lookup(ctx context.Context, name string, out *fuse.Entry
 // ends when it finds a "/@v/" segment, in which case its module field is set.
 type cacheDownloadNode struct {
 	fs.Inode
-	conf *config
+	fs *FS
 
 	segs   []string // path segments, e.g. ["!microsoft", "go-winio"] (empty if module is set)
 	module string   // if non-empty, the module name unescaped, e.g. "Microsoft.com/go-winio" (in the /@v/ directory)
@@ -451,7 +451,7 @@ func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.E
 			return nil, syscall.EIO
 		}
 		in := n.NewInode(ctx, &cacheDownloadNode{
-			conf:   n.conf,
+			fs:     n.fs,
 			module: unescaped,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFDIR | 0755,
@@ -460,7 +460,7 @@ func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.E
 	}
 
 	in := n.NewInode(ctx, &cacheDownloadNode{
-		conf: n.conf,
+		fs:   n.fs,
 		segs: append(n.segs[:len(n.segs):len(n.segs)], name),
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,
@@ -492,7 +492,7 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 	switch dotExt {
 	case ".info", ".mod", ".ziphash":
 		ext := dotExt[1:] // "info", "mod", "ziphash"
-		d := n.conf.Git
+		d := n.fs.Git
 		if d == nil {
 			log.Printf("No git repo configured, cannot resolve %s for %q", ext, n.module)
 			return nil, syscall.EIO
@@ -501,9 +501,9 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 
 		// In case the module isn't downloaded yet, Get it for the side
 		// effect of downloading it and populating all the refs.
-		getRes, getErr := n.conf.Git.Get(ctx, n.module+"@"+version)
+		getRes, getErr := n.fs.Git.Get(ctx, n.module+"@"+version)
 
-		span := n.conf.Stats.StartSpan("getMetaFile-" + ext)
+		span := n.fs.Stats.StartSpan("getMetaFile-" + ext)
 		metaFile, err := d.GetMetaFile(escPath, version, ext)
 		span.End(err)
 		if err != nil {
@@ -570,12 +570,12 @@ func main() {
 		log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
 	}
 
-	conf := &config{
+	conf := &FS{
 		Git: d,
 	}
 
 	root := &moduleNameNode{
-		conf: conf,
+		fs: conf,
 	}
 	server, err := fs.Mount(mntDir, root, &fs.Options{
 		MountOptions: fuse.MountOptions{Debug: *verbose},

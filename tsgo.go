@@ -23,7 +23,7 @@ import (
 // the directory in (2) above.
 type tsgoRoot struct {
 	fs.Inode
-	conf *config
+	conf *FS
 
 	goos   string // "linux", "darwin", etc.
 	goarch string // "amd64", "arm64", etc.
@@ -58,7 +58,7 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	// If it's a directory, it must be a directory with the contents of the git
 	// tree of the tsgo commit.
 	in := n.NewInode(ctx, &treeNode{
-		conf: n.conf,
+		fs:   n.conf,
 		tree: treeHash,
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,

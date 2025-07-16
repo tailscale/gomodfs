@@ -24,7 +24,7 @@ func TestGit(t *testing.T) {
 	t.Logf("mount: %v", tmpMntDir)
 
 	d := &modgit.Downloader{GitRepo: "."}
-	conf := &config{Git: d}
+	mfs := &FS{Git: d}
 
 	curTree, err := exec.Command("git", "rev-parse", "HEAD:testdata").CombinedOutput()
 	if err != nil {
@@ -32,7 +32,7 @@ func TestGit(t *testing.T) {
 	}
 
 	root := &treeNode{
-		conf: conf,
+		fs:   mfs,
 		tree: strings.TrimSpace(string(curTree)),
 	}
 	server, err := fs.Mount(tmpMntDir, root, &fs.Options{
@@ -207,10 +207,10 @@ func TestFilesystem(t *testing.T) {
 			t.Logf("mount: %v", goModCacheDir)
 
 			d := &modgit.Downloader{GitRepo: "."}
-			conf := &config{Git: d}
+			mfs := &FS{Git: d}
 
 			root := &moduleNameNode{
-				conf: conf,
+				fs: mfs,
 			}
 			server, err := fs.Mount(goModCacheDir, root, &fs.Options{
 				MountOptions: fuse.MountOptions{Debug: *debugFUSE},

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -24,8 +25,65 @@ import (
 )
 
 type config struct {
-	Git *modgit.Downloader // or nil to use default client
+	Git   *modgit.Downloader // or nil to use default client
+	Stats Stats
+}
 
+type OpStat struct {
+	Count int
+	Errs  int
+	Total time.Duration
+}
+
+type Stats struct {
+	mu  sync.Mutex
+	ops map[string]*OpStat
+}
+
+type ActiveSpan struct {
+	st    *Stats
+	op    string
+	start time.Time
+	done  bool
+}
+
+func (s *Stats) StartSpan(op string) *ActiveSpan {
+	return &ActiveSpan{
+		st:    s,
+		op:    op,
+		start: time.Now(),
+		done:  false,
+	}
+}
+
+func (s *ActiveSpan) End(err error) {
+	if s.done {
+		panic("End called twice on span")
+	}
+	s.done = true
+
+	st := s.st
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	op, ok := st.ops[s.op]
+	if !ok {
+		if st.ops == nil {
+			st.ops = make(map[string]*OpStat)
+		}
+		op = &OpStat{}
+		st.ops[s.op] = op
+	}
+	op.Count++
+	if err != nil {
+		op.Errs++
+	}
+	d := time.Since(s.start)
+	op.Total += d
+
+	log.Printf("Op %s took %v (calls %v; errs=%d; avg=%v)",
+		s.op,
+		d.Round(time.Millisecond), op.Count, op.Errs, (op.Total / time.Duration(op.Count)).Round(time.Millisecond))
 }
 
 type moduleNameNode struct {
@@ -101,12 +159,16 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to unescape module name %q: %v", escName, err)
 			return nil, syscall.EIO
 		}
+		span := n.conf.Stats.StartSpan("module-name-get-repo")
 		res, err := n.conf.Git.Get(ctx, modName+"@"+ver)
+		span.End(err)
 		if err != nil {
 			log.Printf("Failed to get module %q: %v", modName, err)
 			return nil, syscall.EIO
 		}
+		zipSpan := n.conf.Stats.StartSpan("getZipRoot")
 		treeHash, err := n.conf.Git.GetZipRootTree(res.ModTree)
+		zipSpan.End(err)
 		if err != nil {
 			log.Printf("Failed to get zip root tree for %q (%s): %v", modName, res.ModTree, err)
 			return nil, syscall.EIO
@@ -209,8 +271,11 @@ func (n *treeNode) initEnts() error {
 	if n.treeEnt != nil {
 		return nil
 	}
+
+	span := n.conf.Stats.StartSpan("ls-tree")
 	cmd := exec.Command("git", "-C", n.conf.Git.GitRepo, "ls-tree", n.tree)
 	outData, err := cmd.CombinedOutput()
+	span.End(err)
 	if err != nil {
 		return fmt.Errorf("failed to list tree %q: %w", n.tree, err)
 	}
@@ -266,8 +331,10 @@ func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	}
 	switch ge.gitType {
 	case "blob":
+		span := n.conf.Stats.StartSpan("blob-cat-file")
 		cmd := exec.Command("git", "-C", n.conf.Git.GitRepo, "cat-file", "-p", ge.ref)
 		outData, err := cmd.CombinedOutput()
+		span.End(err)
 		if err != nil {
 			log.Printf("Failed to get contents of %q in tree %q: %v", name, n.tree, err)
 			return nil, syscall.EIO
@@ -436,7 +503,9 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 		// effect of downloading it and populating all the refs.
 		getRes, getErr := n.conf.Git.Get(ctx, n.module+"@"+version)
 
+		span := n.conf.Stats.StartSpan("getMetaFile-" + ext)
 		metaFile, err := d.GetMetaFile(escPath, version, ext)
+		span.End(err)
 		if err != nil {
 			log.Printf("Failed to get %s for %s@%s: %v", ext, n.module, version, err)
 			if getErr != nil {

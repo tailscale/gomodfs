@@ -612,27 +612,6 @@ func (d *Downloader) client() *http.Client {
 	return cmp.Or(d.Client, http.DefaultClient)
 }
 
-func (d *Downloader) AddBlob(r io.Reader) (hash string, err error) {
-	c := d.git("hash-object", "-w", "--stdin")
-	c.Stdin = r
-	out, err := c.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("failed to hash object: %w, %s", err, out)
-	}
-	return string(bytes.TrimSpace(out)), nil
-}
-
-func (d *Downloader) AddTreeFromTextFormat(txtTree []byte) (hash string, err error) {
-	c := d.git("mktree")
-	c.Stdin = bytes.NewReader(txtTree)
-	out, err := c.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("failed to mktree: %w: %s\non:\n%s", err, out, txtTree)
-	}
-	return string(bytes.TrimSpace(out)), nil
-
-}
-
 func (d *Downloader) git(args ...string) *exec.Cmd {
 	allArgs := []string{
 		"-c", "gc.auto=0",

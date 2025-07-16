@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -110,6 +111,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to get zip root tree for %q (%s): %v", modName, res.ModTree, err)
 			return nil, syscall.EIO
 		}
+		log.Printf("lookup tree: mod=%s ver=%v tree=%v", modName, ver, treeHash)
 		return n.NewInode(ctx, &treeNode{
 			conf: n.conf,
 			tree: treeHash,
@@ -399,6 +401,8 @@ func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.E
 	return in, 0
 }
 
+var infoTmpRx = regexp.MustCompile(`\.info\d+\.tmp$`)
+
 // lookupUnderModule is Lookup for a cacheDownloadNode that's hit the /@v/
 // directory, meaning it has a module name set.
 func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -442,6 +446,8 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 			}
 			return nil, syscall.EIO
 		}
+
+		log.Printf("lookup meta: mod=%s file=%s", n.module, name)
 		in := n.NewInode(ctx, &memFile{
 			contents: []byte(metaFile),
 			mode:     0644,
@@ -451,7 +457,21 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 		return in, 0
 	}
 
-	log.Printf("TODO: Lookup(%q) in module %q", name, n.module)
+	if infoTmpRx.MatchString(name) {
+		// Ignore .infoNNN.tmp files. This is cmd/go trying to remove a field
+		// from an info file on disk even though the field doesn't exist; it's
+		// just getting confused because the serialized JSON doesn't match
+		// byte-for-byte because some fields were reordered at some point and
+		// modules older than a certain date have *.info files cached on
+		// proxy.golang.org in different orders and this confused Go's best
+		// effort field cleaning code. But it's fine if the write fails (e.g. on
+		// a read-only filesystem) so we just correctly say it doesn't exist
+		// here and deny the create later by not implementing Create, so the
+		// default is EROFS (read-only filesystem).
+		return nil, syscall.ENOENT
+	}
+
+	log.Printf("TODO: unhandled lookup(%q) in module %q", name, n.module)
 	return nil, syscall.EIO
 }
 

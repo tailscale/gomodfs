@@ -51,6 +51,7 @@ type Result struct {
 	Downloaded bool
 }
 
+// CheckExists checks that the git repo named in d.GitRepo actually exists.
 func (d *Storage) CheckExists() error {
 	out, err := d.git("rev-parse", "--show-toplevel").CombinedOutput()
 	if err != nil {

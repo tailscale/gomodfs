@@ -24,6 +24,7 @@ import (
 	"golang.org/x/mod/module"
 )
 
+// FS is the gomodfs filesystem.
 type FS struct {
 	Git   *gitstore.Storage // or nil to use default client
 	Stats Stats
@@ -137,7 +138,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 				return nil, syscall.ENOENT
 			}
 			return n.NewInode(ctx, &tsgoRoot{
-				conf:   n.fs,
+				fs:     n.fs,
 				goos:   goos,
 				goarch: goarch,
 			}, fs.StableAttr{

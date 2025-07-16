@@ -23,7 +23,7 @@ import (
 // the directory in (2) above.
 type tsgoRoot struct {
 	fs.Inode
-	conf *FS
+	fs *FS
 
 	goos   string // "linux", "darwin", etc.
 	goarch string // "amd64", "arm64", etc.
@@ -41,7 +41,7 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 	hash, wantFile := m[1], m[2] != ""
 
-	treeHash, err := n.conf.Git.GetTailscaleGo(n.goos, n.goarch, hash)
+	treeHash, err := n.fs.Git.GetTailscaleGo(n.goos, n.goarch, hash)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -58,7 +58,7 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	// If it's a directory, it must be a directory with the contents of the git
 	// tree of the tsgo commit.
 	in := n.NewInode(ctx, &treeNode{
-		fs:   n.conf,
+		fs:   n.fs,
 		tree: treeHash,
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,

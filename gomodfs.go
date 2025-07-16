@@ -226,9 +226,14 @@ func (n *treeNode) initEnts() error {
 	ents := []*gitTreeEnt{} // always non-nil
 	bs := bufio.NewScanner(bytes.NewReader(outData))
 	var f []mem.RO
+	tab := mem.S("\t")
 	for bs.Scan() {
-		f = mem.AppendFields(f[:0], mem.B(bs.Bytes()))
-		if len(f) != 4 {
+		modeTypeHash, name, ok := mem.Cut(mem.B(bs.Bytes()), tab)
+		if !ok {
+			return fmt.Errorf("unexpected ls-tree output: %q", bs.Text())
+		}
+		f = mem.AppendFields(f[:0], modeTypeHash)
+		if len(f) != 3 {
 			return fmt.Errorf("unexpected ls-tree output: %q", bs.Text())
 		}
 		mode, _ := mem.ParseUint(f[0], 8, 32)
@@ -236,7 +241,7 @@ func (n *treeNode) initEnts() error {
 			mode:    uint32(mode),
 			gitType: gitType(f[1]),
 			ref:     f[2].StringCopy(),
-			name:    f[3].StringCopy(),
+			name:    name.StringCopy(),
 		})
 	}
 

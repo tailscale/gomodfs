@@ -98,7 +98,7 @@ func walk(t testing.TB, dir string) string {
 	return buf.String()
 }
 
-func TestGoModules(t *testing.T) {
+func TestFilesystem(t *testing.T) {
 
 	type testEnv struct {
 		*testing.T
@@ -170,6 +170,31 @@ func TestGoModules(t *testing.T) {
 				fileSize(
 					"gocloud.dev@v0.20.0/blob/fileblob/example_test.go",
 					2137,
+				),
+			},
+		},
+		{
+			// This test is a regression test for a bug where this repo contains
+			// a tree with a "testing" directory and "testing.md" file. Per
+			// normal sorting rules, "testing" should come first in the tree
+			// object, but git has an undocumented rule that tree entries
+			// pointing to trees have an implicit final "/" at the end of their
+			// name before sorting happens. Without that, git fsck will fail
+			// and git index-pack --strict won't accept the pack file.
+			name: "tree-not-sorted-error",
+			checks: []checker{
+				fileSize(
+					"cache/download/google.golang.org/api/@v/v0.57.0.mod",
+					661,
+				),
+			},
+		},
+		{
+			name: "file-with-spaces", // whoops
+			checks: []checker{
+				fileSize(
+					"github.com/docker/cli@v25.0.0+incompatible/cli/command/image/testdata/remove-command-success.Image Deleted and Untagged.golden",
+					33,
 				),
 			},
 		},

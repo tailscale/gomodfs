@@ -185,6 +185,7 @@ func (d *Downloader) GetTailscaleGo(goos, goarch, commit string) (tree string, e
 }
 
 func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {
+	log.Printf("Adding %s to git ...", modAtVersion)
 
 	// Unzip data to git
 	zr, err := zip.NewReader(bytes.NewReader(parts["zip"]), int64(len(parts["zip"])))
@@ -207,7 +208,6 @@ func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte)
 		if err := tb.addFile("zip/"+name, f.Open, f.Mode()); err != nil {
 			return nil, fmt.Errorf("failed to add file %q: %w", name, err)
 		}
-		log.Printf("Adding %q to git", name)
 	}
 
 	zipHash, err := dirhash.Hash1(fileNames, func(name string) (io.ReadCloser, error) {
@@ -570,9 +570,10 @@ func (pw *packWriter) Write(p []byte) (n int, err error) {
 const execBits = 0111
 
 type dirEnt struct {
-	base  string
-	isDir bool
-	fi    fileInfo
+	base    string
+	sortKey string // either base or base + "/" if isDir
+	isDir   bool
+	fi      fileInfo
 }
 
 // prefix is "" or "dir/".
@@ -584,7 +585,13 @@ func (tb *treeBuilder) dirEnts(prefix string) []dirEnt {
 			continue
 		}
 		base, _, ok := strings.Cut(suf, "/")
-		newEnt := dirEnt{base: base, isDir: ok, fi: fi}
+		newEnt := dirEnt{base: base, isDir: ok, fi: fi, sortKey: base}
+		if newEnt.isDir {
+			// Undocumented git rule: directories have an implicit final "/"
+			// at the end of their name before sorting. Otherwise git fsck
+			// or git index-pack --strict will fail to accept the pack file.
+			newEnt.sortKey += "/"
+		}
 		if was, ok := names[base]; ok {
 			if (was.isDir || newEnt.isDir) && (was.isDir != newEnt.isDir) {
 				panic(fmt.Sprintf("unexpected change from %+v to %+v", was, newEnt))
@@ -595,8 +602,9 @@ func (tb *treeBuilder) dirEnts(prefix string) []dirEnt {
 	}
 	ents := slices.Collect(maps.Values(names))
 	slices.SortFunc(ents, func(a, b dirEnt) int {
-		return cmp.Compare(a.base, b.base)
+		return cmp.Compare(a.sortKey, b.sortKey)
 	})
+
 	return ents
 }
 

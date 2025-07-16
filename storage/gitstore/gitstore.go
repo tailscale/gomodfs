@@ -1,4 +1,9 @@
-package modgit
+// Package gitstore stores gomodfs modules in a git repository.
+//
+// git's storage backend has the nice property that it does de-duping even if
+// your filesystem doesn't. We don't store commits in git-- only trees and
+// blobs. And then refs to trees.
+package gitstore
 
 import (
 	"archive/tar"
@@ -30,7 +35,7 @@ import (
 	"golang.org/x/mod/sumdb/dirhash"
 )
 
-type Downloader struct {
+type Storage struct {
 	Client *http.Client // or nil to use default client
 
 	GitRepo string
@@ -46,7 +51,7 @@ type Result struct {
 	Downloaded bool
 }
 
-func (d *Downloader) CheckExists() error {
+func (d *Storage) CheckExists() error {
 	out, err := d.git("rev-parse", "--show-toplevel").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%q does not appear to be within a git directory: %v, %s", d.GitRepo, err, out)
@@ -54,7 +59,7 @@ func (d *Downloader) CheckExists() error {
 	return nil
 }
 
-func (d *Downloader) moduleProxyURL() string {
+func (d *Storage) moduleProxyURL() string {
 	if d.ModuleProxyURL != "" {
 		return strings.TrimSuffix(d.ModuleProxyURL, "/")
 	}
@@ -63,7 +68,7 @@ func (d *Downloader) moduleProxyURL() string {
 
 // Get gets a module like "tailscale.com@1.2.43" to the Downloader's
 // git repo, either from cache or by downloading it from the Go module proxy.
-func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, error) {
+func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error) {
 	mod, version, ok := strings.Cut(modAtVersion, "@")
 	if !ok {
 		return nil, fmt.Errorf("module %q does not have a version", mod)
@@ -98,7 +103,7 @@ func (d *Downloader) Get(ctx context.Context, modAtVersion string) (*Result, err
 	return d.addToGit(ref, modAtVersion, exts)
 }
 
-func (d *Downloader) GetMetaFile(escMod, version, file string) (string, error) {
+func (d *Storage) GetMetaFile(escMod, version, file string) (string, error) {
 	ref := refName(escMod, version)
 	out, err := d.git("show", ref+":"+file).CombinedOutput()
 	if err != nil {
@@ -107,7 +112,7 @@ func (d *Downloader) GetMetaFile(escMod, version, file string) (string, error) {
 	return string(out), nil
 }
 
-func (d *Downloader) GetZipRootTree(modTreeHash string) (string, error) {
+func (d *Storage) GetZipRootTree(modTreeHash string) (string, error) {
 	out, err := d.git("rev-parse", modTreeHash+":zip").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", modTreeHash, err, out)
@@ -119,7 +124,7 @@ var wordRx = regexp.MustCompile(`^\w+$`)
 
 // TreeOfRef returns the tree hash of the given ref, or ("", false) if it
 // doesn't exist.
-func (d *Downloader) GetTailscaleGo(goos, goarch, commit string) (tree string, err error) {
+func (d *Storage) GetTailscaleGo(goos, goarch, commit string) (tree string, err error) {
 	for _, v := range []string{goos, goarch, commit} {
 		if !wordRx.MatchString(v) {
 			return "", fmt.Errorf("invalid value %q", v)
@@ -184,7 +189,7 @@ func (d *Downloader) GetTailscaleGo(goos, goarch, commit string) (tree string, e
 	return treeHash, nil
 }
 
-func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {
+func (d *Storage) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {
 	log.Printf("Adding %s to git ...", modAtVersion)
 
 	// Unzip data to git
@@ -258,7 +263,7 @@ func (d *Downloader) addToGit(ref, modAtVersion string, parts map[string][]byte)
 	}, nil
 }
 
-func (d *Downloader) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
+func (d *Storage) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
 	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
 	defer cancel()
 
@@ -298,14 +303,14 @@ type object struct {
 }
 
 type treeBuilder struct {
-	d *Downloader         // for git commands
+	d *Storage            // for git commands
 	f map[string]fileInfo // file name to contents
 
 	hashSet map[string]object
 	hashes  []string // hashes in order of addition (dependencies come first)
 }
 
-func newTreeBuilder(d *Downloader) *treeBuilder {
+func newTreeBuilder(d *Storage) *treeBuilder {
 	return &treeBuilder{
 		d: d,
 		f: make(map[string]fileInfo),
@@ -597,11 +602,11 @@ func (tb *treeBuilder) dirEnts(prefix string) []dirEnt {
 	return ents
 }
 
-func (d *Downloader) client() *http.Client {
+func (d *Storage) client() *http.Client {
 	return cmp.Or(d.Client, http.DefaultClient)
 }
 
-func (d *Downloader) git(args ...string) *exec.Cmd {
+func (d *Storage) git(args ...string) *exec.Cmd {
 	allArgs := []string{
 		"-c", "gc.auto=0",
 		"-c", "maintenance.auto=false",

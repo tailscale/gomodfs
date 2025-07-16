@@ -1,4 +1,4 @@
-package modgit
+package gitstore
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 func TestModgit(t *testing.T) {
 	gitDir := t.TempDir()
 
-	var d Downloader
+	var d Storage
 	d.GitRepo = gitDir
 
 	if err := d.git("init").Run(); err != nil {
@@ -45,7 +45,7 @@ func TestTreeBuilder(t *testing.T) {
 		}
 	}()
 
-	var d Downloader
+	var d Storage
 	d.GitRepo = gitDir
 	if err := d.git("init").Run(); err != nil {
 		t.Fatalf("git init: %v", err)

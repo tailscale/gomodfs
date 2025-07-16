@@ -14,7 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/tailscale/gomodfs/modgit"
+	"github.com/tailscale/gomodfs/storage/gitstore"
 )
 
 var debugFUSE = flag.Bool("debug-fuse", false, "verbose FUSE debugging")
@@ -23,8 +23,8 @@ func TestGit(t *testing.T) {
 	tmpMntDir := t.TempDir()
 	t.Logf("mount: %v", tmpMntDir)
 
-	d := &modgit.Downloader{GitRepo: "."}
-	mfs := &FS{Git: d}
+	store := &gitstore.Storage{GitRepo: "."}
+	mfs := &FS{Git: store}
 
 	curTree, err := exec.Command("git", "rev-parse", "HEAD:testdata").CombinedOutput()
 	if err != nil {
@@ -206,8 +206,8 @@ func TestFilesystem(t *testing.T) {
 			goModCacheDir := t.TempDir()
 			t.Logf("mount: %v", goModCacheDir)
 
-			d := &modgit.Downloader{GitRepo: "."}
-			mfs := &FS{Git: d}
+			store := &gitstore.Storage{GitRepo: "."}
+			mfs := &FS{Git: store}
 
 			root := &moduleNameNode{
 				fs: mfs,

@@ -19,13 +19,13 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/tailscale/gomodfs/modgit"
+	"github.com/tailscale/gomodfs/storage/gitstore"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
 )
 
 type FS struct {
-	Git   *modgit.Downloader // or nil to use default client
+	Git   *gitstore.Storage // or nil to use default client
 	Stats Stats
 }
 
@@ -561,7 +561,7 @@ func main() {
 	cmd.Dir = gitCache
 	cmd.Run() // best effort
 
-	d := &modgit.Downloader{GitRepo: gitCache}
+	d := &gitstore.Storage{GitRepo: gitCache}
 
 	mntDir := filepath.Join(os.Getenv("HOME"), "mnt-gomodfs")
 	exec.Command("umount", mntDir).Run() // best effort
@@ -570,12 +570,12 @@ func main() {
 		log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
 	}
 
-	conf := &FS{
+	mfs := &FS{
 		Git: d,
 	}
 
 	root := &moduleNameNode{
-		fs: conf,
+		fs: mfs,
 	}
 	server, err := fs.Mount(mntDir, root, &fs.Options{
 		MountOptions: fuse.MountOptions{Debug: *verbose},

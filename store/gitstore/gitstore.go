@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"net/http"
@@ -28,9 +29,13 @@ import (
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/tailscale/gomodfs/store"
+	"go4.org/mem"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 )
@@ -80,7 +85,13 @@ func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error)
 	}
 
 	// See if the ref exists first.
-	ref := refName(escMod, version)
+	ref, err := refName(store.ModuleVersion{
+		Module:  mod,
+		Version: version,
+	})
+	if err != nil {
+		return nil, err
+	}
 	treeRef := ref + "^{tree}"
 	out, err := d.git("rev-parse", treeRef).Output()
 	if err == nil {
@@ -104,8 +115,11 @@ func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error)
 	return d.addToGit(ref, modAtVersion, exts)
 }
 
-func (d *Storage) GetMetaFile(escMod, version, file string) (string, error) {
-	ref := refName(escMod, version)
+func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (string, error) {
+	ref, err := refName(mv)
+	if err != nil {
+		return "", fmt.Errorf("failed to get ref name for %q: %w", mv, err)
+	}
 	out, err := d.git("show", ref+":"+file).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed to get %q for %q: %w, %s", file, ref, err, out)
@@ -619,6 +633,145 @@ func (d *Storage) git(args ...string) *exec.Cmd {
 }
 
 // escModuleName is like "!foo!bar.com" form (for FooBar.com)
-func refName(escModuleName, version string) string {
-	return "refs/gomod/" + url.PathEscape(escModuleName) + "@" + url.PathEscape(version)
+func refName(h store.ModuleVersion) (string, error) {
+	escModuleName, err := module.EscapePath(h.Module)
+	if err != nil {
+		return "", fmt.Errorf("failed to escape module name %q: %w", h.Module, err)
+	}
+	escVersion, err := module.EscapeVersion(h.Version)
+	if err != nil {
+		return "", fmt.Errorf("failed to escape version %q: %w", h.Version, err)
+	}
+	return "refs/gomod/" + url.PathEscape(escModuleName) + "@" + url.PathEscape(escVersion), nil
+}
+
+type modHandle struct {
+	modTree string
+
+	mu sync.Mutex
+	// ...
+}
+
+func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) (mem.RO, error) {
+	var zero mem.RO
+	tree := h.(*modHandle).modTree
+
+	out, err := s.git("show", tree+":zip/"+path).CombinedOutput()
+	if err != nil {
+		return zero, err
+	}
+	return mem.S(string(out)), nil
+}
+
+func (s *Storage) GetInfo(ctx context.Context, h store.ModuleVersion) (mem.RO, error) {
+	var zero mem.RO
+	ref, err := refName(h)
+	if err != nil {
+		return zero, err
+	}
+	out, err := s.git("show", ref+":info").CombinedOutput()
+	if err != nil {
+		// TODO: handle git error codes better; for now just map everything to
+		// ErrCacheMiss.
+		return zero, store.ErrCacheMiss
+	}
+	return mem.S(string(out)), nil
+}
+
+func (s *Storage) GetMod(ctx context.Context, h store.ModuleVersion) (mem.RO, error) {
+	var zero mem.RO
+	ref, err := refName(h)
+	if err != nil {
+		return zero, err
+	}
+	out, err := s.git("show", ref+":mod").CombinedOutput()
+	if err != nil {
+		// TODO: handle git error codes better; for now just map everything to
+		// ErrCacheMiss.
+		return zero, store.ErrCacheMiss
+	}
+	return mem.S(string(out)), nil
+}
+
+func (s *Storage) GetZipRoot(ctx context.Context, h store.ModuleVersion) (store.ModHandle, error) {
+	var zero mem.RO
+	ref, err := refName(h)
+	if err != nil {
+		return zero, err
+	}
+	out, err := s.git("rev-parse", ref+"^{tree}").CombinedOutput()
+	if err != nil {
+		// TODO: handle git error codes better; for now just map everything to
+		// ErrCacheMiss.
+		return zero, store.ErrCacheMiss
+	}
+	return &modHandle{modTree: strings.TrimSpace(string(out))}, nil
+}
+
+func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) (mem.RO, error) {
+	tree := h.(*modHandle).modTree
+
+	var zero mem.RO
+	out, err := s.git("show", tree+":ziphash").CombinedOutput()
+	if err != nil {
+		// TODO: handle git error codes better; for now just map everything to
+		// ErrCacheMiss.
+		return zero, err
+	}
+	return mem.S(string(out)), nil
+}
+
+func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data store.PutModuleData) error {
+	panic("TODO")
+}
+
+func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {
+	tree := h.(*modHandle).modTree
+
+	out, err := s.git("ls-tree",
+		"-t", // include trees
+		"--format=%(objectmode) %(objectsize) %(path)",
+		tree+":zip/"+path).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tree %q: %w, %s", tree, err, out)
+	}
+
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	var ents []store.Dirent
+	for sc.Scan() {
+		line := sc.Text()
+		modeStr, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			return nil, fmt.Errorf("unexpected git ls-tree output: %q", line)
+		}
+		sizeStr, name, ok := strings.Cut(rest, " ")
+		if !ok {
+			return nil, fmt.Errorf("unexpected git ls-tree output: %q", line)
+		}
+		if sizeStr == "-" {
+			ents = append(ents, store.Dirent{
+				Name: name,
+				Mode: 0755 | fs.ModeDir, // only ModeDir really matters
+			})
+			continue
+		}
+		mode, err := strconv.ParseUint(modeStr, 8, 32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse mode in line %q", line)
+		}
+		size, err := strconv.ParseInt(sizeStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse size in line %q: %w", line, err)
+		}
+		ents = append(ents, store.Dirent{
+			Name: name,
+			Mode: fs.FileMode(mode),
+			Size: size,
+		})
+	}
+	return ents, nil
+}
+
+func (s *Storage) StatFile(ctx context.Context, h store.ModHandle, path string) (_ os.FileMode, size int64, _ error) {
+	panic("TODO")
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -19,14 +20,17 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/tailscale/gomodfs/storage/gitstore"
+	"github.com/tailscale/gomodfs/store"
+	"github.com/tailscale/gomodfs/store/gitstore"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
 )
 
 // FS is the gomodfs filesystem.
 type FS struct {
-	Git   *gitstore.Storage // or nil to use default client
+	Git   *gitstore.Storage // legacy storage; TODO: remove this field, move all callers to Store interface
+	Store store.Store
+
 	Stats Stats
 }
 
@@ -160,24 +164,36 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to unescape module name %q: %v", escName, err)
 			return nil, syscall.EIO
 		}
+		mv := store.ModuleVersion{
+			Module:  modName,
+			Version: ver,
+		}
 		span := n.fs.Stats.StartSpan("module-name-get-repo")
-		res, err := n.fs.Git.Get(ctx, modName+"@"+ver)
+		root, err := n.fs.Store.GetZipRoot(ctx, mv)
 		span.End(err)
+		if errors.Is(err, store.ErrCacheMiss) {
+			// TODO: move faulting logic up here.
+			_, err := n.fs.Git.Get(ctx, modName+"@"+ver)
+			if err != nil {
+				log.Printf("Failed to get module %q: %v", modName, err)
+				return nil, syscall.EIO
+			}
+			root, err = n.fs.Store.GetZipRoot(ctx, mv)
+			if err != nil {
+				log.Printf("Failed to get zip root on second try: %v", err)
+				return nil, syscall.EIO
+			}
+		}
 		if err != nil {
-			log.Printf("Failed to get module %q: %v", modName, err)
+			log.Printf("Failed to get ziproot handle for module %q: %v", modName, err)
 			return nil, syscall.EIO
 		}
-		zipSpan := n.fs.Stats.StartSpan("getZipRoot")
-		treeHash, err := n.fs.Git.GetZipRootTree(res.ModTree)
-		zipSpan.End(err)
-		if err != nil {
-			log.Printf("Failed to get zip root tree for %q (%s): %v", modName, res.ModTree, err)
-			return nil, syscall.EIO
-		}
-		log.Printf("lookup tree: mod=%s ver=%v tree=%v", modName, ver, treeHash)
-		return n.NewInode(ctx, &treeNode{
+		log.Printf("lookup tree: mod=%s ver=%v", modName, ver)
+		return n.NewInode(ctx, &pathUnderZipRoot{
 			fs:   n.fs,
-			tree: treeHash,
+			mv:   mv,
+			root: root,
+			mode: os.ModeDir,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFDIR | 0755,
 		}), 0
@@ -189,6 +205,107 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 		Mode: fuse.S_IFDIR | 0755,
 	})
 	return in, 0
+}
+
+// pathUnderZipRoot is some file or directory under a module's zip root.
+type pathUnderZipRoot struct {
+	fs.Inode
+	fs   *FS
+	mv   store.ModuleVersion // module version for this directory
+	root store.ModHandle
+	mode os.FileMode // either fs.ModeDir or regular file mode bits, either 0644 or 0755
+	size int64       // for regular files; -1 if unknown (will require extra fetches)
+	path string      // empty for root, else "dir" or "dir/subdir"; no trailing slash
+
+	mu   sync.Mutex
+	ents []*store.Dirent
+	ent  map[string]*store.Dirent // non-nil once ents is initialized
+}
+
+var (
+	_ = (fs.NodeLookuper)((*pathUnderZipRoot)(nil))
+	//_ = (fs.NodeReaddirer)((*pathUnderZipRoot)(nil))
+	//_ = (fs.NodeReader)((*pathUnderZipRoot)(nil))
+	_ = (fs.NodeGetattrer)((*pathUnderZipRoot)(nil))
+)
+
+func (n *pathUnderZipRoot) initDirEntsLocked(ctx context.Context) error {
+	if n.ent != nil {
+		return nil
+	}
+	ents, err := n.fs.Store.Readdir(ctx, n.root, n.path)
+	if err != nil {
+		return fmt.Errorf("failed to get dir files for %q: %w", n.path, err)
+	}
+	n.ent = make(map[string]*store.Dirent)
+	for _, e := range ents {
+		n.ent[e.Name] = &e
+		n.ents = append(n.ents, &e)
+	}
+	return nil
+}
+
+func (n *pathUnderZipRoot) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.AttrValid = 86400 * 90 // valid for 90 days
+	if n.size >= 0 {
+		out.Size = uint64(n.size)
+	} else {
+		log.Printf("TODO: get size for %q", n.path)
+	}
+
+	var fuseMode uint32
+	if n.mode.IsDir() {
+		fuseMode = fuse.S_IFDIR | 0755
+	} else {
+		fuseMode = fuse.S_IFREG | 0644
+		if n.mode&0111 != 0 {
+			fuseMode = fuse.S_IFREG | 0755 // executable file
+		}
+	}
+
+	out.Mode = fuseMode
+	return 0
+}
+
+func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if !n.mode.IsDir() {
+		return nil, syscall.ENOTDIR
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if err := n.initDirEntsLocked(ctx); err != nil {
+		log.Printf("Lookup(%v, %q, %q): %v", n.mv, n.path, name, err)
+		return nil, syscall.EIO
+	}
+
+	ent, ok := n.ent[name]
+	if !ok {
+		return nil, syscall.ENOENT
+	}
+
+	path := name
+	if n.path != "" {
+		path = n.path + "/" + name
+	}
+	var fuseMode uint32
+	if ent.Mode.IsDir() {
+		fuseMode = fuse.S_IFDIR | 0755
+	} else {
+		fuseMode = fuse.S_IFREG | 0644
+		if ent.Mode&0o111 != 0 {
+			fuseMode = fuse.S_IFREG | 0755 // executable file
+		}
+	}
+	return n.NewInode(ctx, &pathUnderZipRoot{
+		fs:   n.fs,
+		mv:   n.mv,
+		root: n.root,
+		path: path,
+		mode: ent.Mode,
+		size: ent.Size,
+	}, fs.StableAttr{Mode: fuseMode}), 0
 }
 
 type memFile struct {
@@ -483,12 +600,6 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 		return nil, syscall.ENOENT
 	}
 
-	escPath, err := module.EscapePath(n.module)
-	if err != nil {
-		log.Printf("Failed to escape module name %q: %v", n.module, err)
-		return nil, syscall.EIO
-	}
-
 	dotExt := filepath.Ext(name)
 	switch dotExt {
 	case ".info", ".mod", ".ziphash":
@@ -499,13 +610,16 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 			return nil, syscall.EIO
 		}
 		version := strings.TrimSuffix(name, dotExt) // "v0.0.0-20240501181205-ae6ca9944745"
-
+		mv := store.ModuleVersion{
+			Module:  n.module,
+			Version: version,
+		}
 		// In case the module isn't downloaded yet, Get it for the side
 		// effect of downloading it and populating all the refs.
 		getRes, getErr := n.fs.Git.Get(ctx, n.module+"@"+version)
 
 		span := n.fs.Stats.StartSpan("getMetaFile-" + ext)
-		metaFile, err := d.GetMetaFile(escPath, version, ext)
+		metaFile, err := d.GetMetaFile(mv, ext)
 		span.End(err)
 		if err != nil {
 			log.Printf("Failed to get %s for %s@%s: %v", ext, n.module, version, err)
@@ -562,7 +676,7 @@ func main() {
 	cmd.Dir = gitCache
 	cmd.Run() // best effort
 
-	d := &gitstore.Storage{GitRepo: gitCache}
+	gitStore := &gitstore.Storage{GitRepo: gitCache}
 
 	mntDir := filepath.Join(os.Getenv("HOME"), "mnt-gomodfs")
 	exec.Command("umount", mntDir).Run() // best effort
@@ -572,7 +686,8 @@ func main() {
 	}
 
 	mfs := &FS{
-		Git: d,
+		Git:   gitStore,
+		Store: gitStore,
 	}
 
 	root := &moduleNameNode{

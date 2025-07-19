@@ -278,6 +278,7 @@ func (fs *FS) getZiphash(ctx context.Context, mv store.ModuleVersion) (data []by
 	zr, err := fs.getZipRoot(ctx, mv)
 	if err != nil {
 		log.Printf("Failed to get zip root for %v: %v", mv, err)
+		return nil, err
 	}
 	return fs.Store.GetZipHash(ctx, zr)
 }

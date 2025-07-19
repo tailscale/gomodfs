@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"slices"
@@ -91,6 +92,8 @@ func (s *ActiveSpan) End(err error) {
 		if errors.Is(err, context.Canceled) ||
 			errors.Is(err, context.DeadlineExceeded) {
 			os.CtxErrs++
+		} else {
+			log.Printf("op %q error: %v", s.op, err)
 		}
 	}
 	d := time.Since(s.start)

@@ -77,6 +77,8 @@ func (fs *FS) downloadModFile(ctx context.Context, mv store.ModuleVersion) (_ []
 	sp := fs.Stats.StartSpan("download-mod-file")
 	defer func() { sp.End(err) }()
 
+	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
+
 	vi, err, _ := fs.sf.Do("download-mod:"+mv.Module+"@"+mv.Version, func() (any, error) {
 		urlBase, err := fs.modURLBase(mv)
 		if err != nil {
@@ -102,6 +104,8 @@ func (fs *FS) downloadModFile(ctx context.Context, mv store.ModuleVersion) (_ []
 func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
 	sp := fs.Stats.StartSpan("download-info-file")
 	defer func() { sp.End(err) }()
+
+	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
 
 	vi, err, _ := fs.sf.Do("download-info:"+mv.Module+"@"+mv.Version, func() (any, error) {
 		urlBase, err := fs.modURLBase(mv)
@@ -225,6 +229,8 @@ func (fs *FS) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err err
 func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.ModHandle, err error) {
 	span := fs.Stats.StartSpan("get-zip-root")
 	defer func() { span.End(err) }()
+
+	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
 
 	rooti, err, _ := fs.sf.Do("get-zip-root:"+mv.Module+"@"+mv.Version, func() (any, error) {
 		root, err := fs.Store.GetZipRoot(ctx, mv)

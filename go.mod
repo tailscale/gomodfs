@@ -7,6 +7,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.7.2
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/mod v0.24.0
+	golang.org/x/sync v0.16.0
 )
 
 require (

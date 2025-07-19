@@ -23,7 +23,7 @@ func TestModgit(t *testing.T) {
 	const mod = "github.com/shurcooL/githubv4@v0.0.0-20240727222349-48295856cce7"
 
 	ctx := context.Background()
-	res, err := d.Get(ctx, mod)
+	res, err := d.oldGet(ctx, mod)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}

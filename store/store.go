@@ -5,8 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-
-	"go4.org/mem"
 )
 
 var ErrCacheMiss = errors.New("cache miss")
@@ -16,15 +14,17 @@ type Store interface {
 	// GetZipRoot returns a handle to the root of a module's zip file for a given version.
 	// If the module is not cached, it should return ErrCacheMiss.
 	GetZipRoot(context.Context, ModuleVersion) (ModHandle, error)
-	GetInfo(context.Context, ModuleVersion) (mem.RO, error) // or ErrCacheMiss
-	GetMod(context.Context, ModuleVersion) (mem.RO, error)  // or ErrCacheMiss
+	GetInfoFile(context.Context, ModuleVersion) ([]byte, error) // or ErrCacheMiss
+	GetModFile(context.Context, ModuleVersion) ([]byte, error)  // or ErrCacheMiss
+	PutModFile(context.Context, ModuleVersion, []byte) error
+	PutInfoFile(context.Context, ModuleVersion, []byte) error
 
 	// Given a ModHandle returned by GetZipRoot, ...
 
-	GetZipHash(context.Context, ModHandle) (mem.RO, error) // but _not_ ErrCacheMiss
+	GetZipHash(context.Context, ModHandle) ([]byte, error) // but _not_ ErrCacheMiss
 
 	// path is  "foo.txt" or "foo/bar.txt"
-	GetFile(ctx context.Context, h ModHandle, path string) (mem.RO, error)
+	GetFile(ctx context.Context, h ModHandle, path string) ([]byte, error)
 	StatFile(ctx context.Context, h ModHandle, path string) (_ os.FileMode, size int64, _ error)
 
 	// path is "" for root, else "foo" or "foo/bar" (no trailing slash)
@@ -32,15 +32,15 @@ type Store interface {
 
 	// PutModule populates the store with the given module version data
 	// when ErrCacheMiss is returned.
-	PutModule(context.Context, ModuleVersion, PutModuleData) error
+	PutModule(context.Context, ModuleVersion, PutModuleData) (ModHandle, error)
 }
 
 type PutModuleData struct {
-	InfoFile mem.RO // the cache/download/foo/bar/@v/v1.23.info file
-	ModFile  mem.RO // the cache/download/foo/bar/@v/v1.23.mod file
-	ZipHash  mem.RO // the cache/download/foo/bar/@v/v1.23.ziphash file
+	InfoFile []byte // the cache/download/foo/bar/@v/v1.23.info file
+	ModFile  []byte // the cache/download/foo/bar/@v/v1.23.mod file
+	ZipHash  []byte // the cache/download/foo/bar/@v/v1.23.ziphash file
 
-	// Files are the files in the zip file.
+	// Files are the files in the zip file.3
 	// Directories are implicit.
 	Files []PutFile
 }
@@ -50,7 +50,8 @@ type PutFile interface {
 	// relative to the root of the zip file.
 	// For example "main.go" or "foo/bar/baz_test.go".
 	Path() string
-	Size() int64 // size of the file in bytes
+	Mode() os.FileMode // only 0644 or 0755 are valid
+	Size() int64       // size of the file in bytes
 	Open() (io.ReadCloser, error)
 }
 

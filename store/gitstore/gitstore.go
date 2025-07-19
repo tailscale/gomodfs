@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
@@ -41,8 +42,8 @@ import (
 )
 
 type Storage struct {
-	Client *http.Client // or nil to use default client
-
+	Client  *http.Client // or nil to use default client
+	Stats   *stats.Stats // or nil if stats are not enabled
 	GitRepo string
 
 	// ModuleProxyURL is the URL of the Go module proxy to use.
@@ -74,7 +75,7 @@ func (d *Storage) moduleProxyURL() string {
 
 // Get gets a module like "tailscale.com@1.2.43" to the Downloader's
 // git repo, either from cache or by downloading it from the Go module proxy.
-func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error) {
+func (d *Storage) oldGet(ctx context.Context, modAtVersion string) (_ *Result, retErr error) {
 	mod, version, ok := strings.Cut(modAtVersion, "@")
 	if !ok {
 		return nil, fmt.Errorf("module %q does not have a version", mod)
@@ -83,6 +84,9 @@ func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to escape module name %q: %w", mod, err)
 	}
+
+	sp := d.Stats.StartSpan("git-store-legacy-get-module")
+	defer func() { sp.End(retErr) }()
 
 	// See if the ref exists first.
 	ref, err := refName(store.ModuleVersion{
@@ -104,7 +108,9 @@ func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error)
 	exts := map[string][]byte{}
 	for _, ext := range []string{"zip", "info", "mod"} {
 		urlStr := d.moduleProxyURL() + "/" + escMod + "/@v/" + version + "." + ext
+		sp := d.Stats.StartSpan("net-fetch-" + ext)
 		data, err := d.netSlurp(ctx, urlStr)
+		sp.End(err)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
 		}
@@ -115,24 +121,19 @@ func (d *Storage) Get(ctx context.Context, modAtVersion string) (*Result, error)
 	return d.addToGit(ref, modAtVersion, exts)
 }
 
-func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (string, error) {
+func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (_ string, retErr error) {
+	sp := d.Stats.StartSpan("gitstore-GetMetaFile-" + file)
+	defer func() { sp.End(retErr) }()
+
 	ref, err := refName(mv)
 	if err != nil {
 		return "", fmt.Errorf("failed to get ref name for %q: %w", mv, err)
 	}
 	out, err := d.git("show", ref+":"+file).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("failed to get %q for %q: %w, %s", file, ref, err, out)
+		return "", store.ErrCacheMiss
 	}
 	return string(out), nil
-}
-
-func (d *Storage) GetZipRootTree(modTreeHash string) (string, error) {
-	out, err := d.git("rev-parse", modTreeHash+":zip").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("failed to get zip hash for %q: %w, %s", modTreeHash, err, out)
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 var wordRx = regexp.MustCompile(`^\w+$`)
@@ -645,6 +646,22 @@ func refName(h store.ModuleVersion) (string, error) {
 	return "refs/gomod/" + url.PathEscape(escModuleName) + "@" + url.PathEscape(escVersion), nil
 }
 
+func modRefName(h store.ModuleVersion) (string, error) {
+	base, err := refName(h)
+	if err != nil {
+		return "", err
+	}
+	return base + "(mod)", nil
+}
+
+func infoRefName(h store.ModuleVersion) (string, error) {
+	base, err := refName(h)
+	if err != nil {
+		return "", err
+	}
+	return base + "(info)", nil
+}
+
 type modHandle struct {
 	modTree string
 
@@ -652,50 +669,103 @@ type modHandle struct {
 	// ...
 }
 
-func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) (mem.RO, error) {
-	var zero mem.RO
+func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) ([]byte, error) {
 	tree := h.(*modHandle).modTree
 
 	out, err := s.git("show", tree+":zip/"+path).CombinedOutput()
 	if err != nil {
-		return zero, err
+		return nil, err
 	}
-	return mem.S(string(out)), nil
+	return out, nil
 }
 
-func (s *Storage) GetInfo(ctx context.Context, h store.ModuleVersion) (mem.RO, error) {
-	var zero mem.RO
-	ref, err := refName(h)
+func (s *Storage) GetInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
+	sp := s.Stats.StartSpan("gitstore-GetInfoFile")
+	defer func() { sp.End(err) }()
+
+	ref, err := refName(mv)
 	if err != nil {
-		return zero, err
+		return nil, err
 	}
 	out, err := s.git("show", ref+":info").CombinedOutput()
+	if err == nil {
+		return out, nil
+	}
+	// If we don't have the full module downloaded, maybe
+	// we have just the info file.
+	ref, err = infoRefName(mv)
+	if err != nil {
+		return nil, err
+	}
+	out, err = s.git("show", ref).CombinedOutput()
+	if err == nil {
+		return out, nil
+	}
+	// TODO: handle git error codes better; for now just map everything to
+	// ErrCacheMiss.
+	return nil, store.ErrCacheMiss
+}
+
+func (s *Storage) GetModFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
+	sp := s.Stats.StartSpan("gitstore-GetModFile")
+	defer func() { sp.End(err) }()
+
+	ref, err := modRefName(mv)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.git("show", ref).CombinedOutput()
 	if err != nil {
 		// TODO: handle git error codes better; for now just map everything to
 		// ErrCacheMiss.
-		return zero, store.ErrCacheMiss
+		return nil, store.ErrCacheMiss
 	}
-	return mem.S(string(out)), nil
+	return out, nil
 }
 
-func (s *Storage) GetMod(ctx context.Context, h store.ModuleVersion) (mem.RO, error) {
-	var zero mem.RO
-	ref, err := refName(h)
+func (s *Storage) PutModFile(ctx context.Context, mv store.ModuleVersion, data []byte) (err error) {
+	sp := s.Stats.StartSpan("gitstore-PutModFile")
+	defer func() { sp.End(err) }()
+
+	ref, err := modRefName(mv)
 	if err != nil {
-		return zero, err
+		return err
 	}
-	out, err := s.git("show", ref+":mod").CombinedOutput()
+	c := s.git("hash-object", "-w", "--stdin")
+	c.Stdin = bytes.NewReader(data)
+	out, err := c.CombinedOutput()
 	if err != nil {
-		// TODO: handle git error codes better; for now just map everything to
-		// ErrCacheMiss.
-		return zero, store.ErrCacheMiss
+		return fmt.Errorf("failed to hash object for %q: %w, %s", mv, err, out)
 	}
-	return mem.S(string(out)), nil
+	if out, err := s.git("update-ref", ref, strings.TrimSpace(string(out))).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to update mod blob ref %q: %w: %s", ref, err, out)
+	}
+	return nil
 }
 
-func (s *Storage) GetZipRoot(ctx context.Context, h store.ModuleVersion) (store.ModHandle, error) {
+func (s *Storage) PutInfoFile(ctx context.Context, mv store.ModuleVersion, data []byte) (err error) {
+	sp := s.Stats.StartSpan("gitstore-PutInfoFile")
+	defer func() { sp.End(err) }()
+
+	ref, err := infoRefName(mv)
+	if err != nil {
+		return err
+	}
+	c := s.git("hash-object", "-w", "--stdin")
+	c.Stdin = bytes.NewReader(data)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to hash object for %q: %w, %s", mv, err, out)
+	}
+	if out, err := s.git("update-ref", ref, strings.TrimSpace(string(out))).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to update info blob ref %q: %w: %s", ref, err, out)
+	}
+	return nil
+}
+
+func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
 	var zero mem.RO
-	ref, err := refName(h)
+	ref, err := refName(mv)
 	if err != nil {
 		return zero, err
 	}
@@ -708,21 +778,56 @@ func (s *Storage) GetZipRoot(ctx context.Context, h store.ModuleVersion) (store.
 	return &modHandle{modTree: strings.TrimSpace(string(out))}, nil
 }
 
-func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) (mem.RO, error) {
+func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, error) {
 	tree := h.(*modHandle).modTree
 
-	var zero mem.RO
 	out, err := s.git("show", tree+":ziphash").CombinedOutput()
 	if err != nil {
-		// TODO: handle git error codes better; for now just map everything to
-		// ErrCacheMiss.
-		return zero, err
+		return nil, err
 	}
-	return mem.S(string(out)), nil
+	return out, nil
 }
 
-func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data store.PutModuleData) error {
-	panic("TODO")
+func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data store.PutModuleData) (store.ModHandle, error) {
+	ref, err := refName(mv)
+	if err != nil {
+		return nil, err
+	}
+
+	tb := newTreeBuilder(s)
+	static := func(v []byte) func() (io.ReadCloser, error) {
+		return func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(v)), nil
+		}
+	}
+	if err := tb.addFile("ziphash", static(data.ZipHash), 0644); err != nil {
+		return nil, fmt.Errorf("failed to add ziphash file: %w", err)
+	}
+	if err := tb.addFile("info", static(data.InfoFile), 0644); err != nil {
+		return nil, fmt.Errorf("failed to add info file: %w", err)
+	}
+	if err := tb.addFile("mod", static(data.ModFile), 0644); err != nil {
+		return nil, fmt.Errorf("failed to add mod file: %w", err)
+	}
+	for _, f := range data.Files {
+		if err := tb.addFile("zip/"+f.Path(), f.Open, f.Mode()); err != nil {
+			return nil, fmt.Errorf("failed to add zip file %q: %w", f.Path(), err)
+		}
+	}
+
+	treeHash, err := tb.buildTree("")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build git tree: %w", err)
+	}
+	if _, err := tb.sendToGit(); err != nil {
+		log.Printf("git sendToGit error for %v: %v", mv, err)
+	}
+
+	if out, err := s.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
+	}
+
+	return &modHandle{modTree: treeHash}, nil
 }
 
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {

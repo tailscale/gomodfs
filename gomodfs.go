@@ -1,13 +1,19 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"math"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,10 +26,13 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
 	"github.com/tailscale/gomodfs/store/gitstore"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
+	"golang.org/x/sync/singleflight"
 )
 
 // FS is the gomodfs filesystem.
@@ -31,64 +40,248 @@ type FS struct {
 	Git   *gitstore.Storage // legacy storage; TODO: remove this field, move all callers to Store interface
 	Store store.Store
 
-	Stats Stats
+	Stats  *stats.Stats // or nil if stats are not enabled
+	Client *http.Client // or nil to use default client
+
+	sf singleflight.Group
+
+	// ModuleProxyURL is the URL of the Go module proxy to use.
+	// If empty, "https://proxy.golang.org" is used.
+	// It should not have a trailing slash.
+	ModuleProxyURL string
 }
 
-type OpStat struct {
-	Count int
-	Errs  int
-	Total time.Duration
+func (fs *FS) client() *http.Client {
+	return cmp.Or(fs.Client, http.DefaultClient)
 }
 
-type Stats struct {
-	mu  sync.Mutex
-	ops map[string]*OpStat
-}
-
-type ActiveSpan struct {
-	st    *Stats
-	op    string
-	start time.Time
-	done  bool
-}
-
-func (s *Stats) StartSpan(op string) *ActiveSpan {
-	return &ActiveSpan{
-		st:    s,
-		op:    op,
-		start: time.Now(),
-		done:  false,
+func (fs *FS) moduleProxyURL() string {
+	if fs.ModuleProxyURL != "" {
+		return strings.TrimSuffix(fs.ModuleProxyURL, "/")
 	}
+	return "https://proxy.golang.org"
 }
 
-func (s *ActiveSpan) End(err error) {
-	if s.done {
-		panic("End called twice on span")
-	}
-	s.done = true
-
-	st := s.st
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	op, ok := st.ops[s.op]
-	if !ok {
-		if st.ops == nil {
-			st.ops = make(map[string]*OpStat)
-		}
-		op = &OpStat{}
-		st.ops[s.op] = op
-	}
-	op.Count++
+func (fs *FS) modURLBase(mv store.ModuleVersion) (string, error) {
+	escMod, err := module.EscapePath(mv.Module)
 	if err != nil {
-		op.Errs++
+		return "", fmt.Errorf("failed to escape module name %q: %w", mv.Module, err)
 	}
-	d := time.Since(s.start)
-	op.Total += d
+	escVer, err := module.EscapeVersion(mv.Version)
+	if err != nil {
+		return "", fmt.Errorf("failed to escape version %q: %w", mv.Version, err)
+	}
+	return fs.moduleProxyURL() + "/" + escMod + "/@v/" + escVer, nil
+}
 
-	log.Printf("Op %s took %v (calls %v; errs=%d; avg=%v)",
-		s.op,
-		d.Round(time.Millisecond), op.Count, op.Errs, (op.Total / time.Duration(op.Count)).Round(time.Millisecond))
+func (fs *FS) downloadModFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
+	sp := fs.Stats.StartSpan("download-mod-file")
+	defer func() { sp.End(err) }()
+
+	vi, err, _ := fs.sf.Do("download-mod:"+mv.Module+"@"+mv.Version, func() (any, error) {
+		urlBase, err := fs.modURLBase(mv)
+		if err != nil {
+			return nil, err
+		}
+		urlStr := urlBase + ".mod"
+
+		data, err := fs.netSlurp(ctx, urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+		}
+		if err := fs.Store.PutModFile(ctx, mv, data); err != nil {
+			return nil, fmt.Errorf("failed to store mod file for %q: %w", mv, err)
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return vi.([]byte), nil
+}
+
+func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
+	sp := fs.Stats.StartSpan("download-info-file")
+	defer func() { sp.End(err) }()
+
+	vi, err, _ := fs.sf.Do("download-info:"+mv.Module+"@"+mv.Version, func() (any, error) {
+		urlBase, err := fs.modURLBase(mv)
+		if err != nil {
+			return nil, err
+		}
+		urlStr := urlBase + ".info"
+
+		data, err := fs.netSlurp(ctx, urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+		}
+		if err := fs.Store.PutInfoFile(ctx, mv, data); err != nil {
+			return nil, fmt.Errorf("failed to store info file for %q: %w", mv, err)
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return vi.([]byte), nil
+}
+
+func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
+	baseURL, err := fs.modURLBase(mv)
+	if err != nil {
+		return nil, err
+	}
+
+	download := map[string][]byte{} // extension (zip, info, mod) -> data
+	for _, ext := range []string{"zip", "info", "mod"} {
+		urlStr := baseURL + "." + ext
+		sp := fs.Stats.StartSpan("net-downloadZip-ext-" + ext)
+		data, err := fs.netSlurp(ctx, urlStr)
+		sp.End(err)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+		}
+		download[ext] = data
+		log.Printf("Downloaded %d bytes from %v", len(data), urlStr)
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(download["zip"]), int64(len(download["zip"])))
+	if err != nil {
+		return nil, fmt.Errorf("failed to unzip module data: %w", err)
+	}
+
+	put := store.PutModuleData{
+		InfoFile: download["info"],
+		ModFile:  download["mod"],
+		Files:    make([]store.PutFile, 0, len(zr.File)),
+	}
+
+	fileNames := make([]string, 0, len(zr.File))
+	zipOfFile := map[string]*zip.File{}
+	for _, f := range zr.File {
+		fileNames = append(fileNames, f.Name)
+		zipOfFile[f.Name] = f
+	}
+
+	zipHash, err := dirhash.Hash1(fileNames, func(name string) (io.ReadCloser, error) {
+		f := zipOfFile[name]
+		if f == nil {
+			return nil, fmt.Errorf("file %q not found in zip", name) // should never happen
+		}
+		return f.Open()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash zip contents: %w", err)
+	}
+	put.ZipHash = []byte(zipHash)
+
+	for _, f := range zr.File {
+		put.Files = append(put.Files, putFile{
+			path: f.Name[len(mv.Module)+len("@")+len(mv.Version)+len("/"):], // remove module name and version prefix
+			zf:   f,
+		})
+	}
+
+	return fs.Store.PutModule(ctx, mv, put)
+}
+
+type putFile struct {
+	path string
+	zf   *zip.File
+}
+
+func (pf putFile) Path() string                 { return pf.path }
+func (pf putFile) Size() int64                  { return int64(pf.zf.UncompressedSize64) }
+func (pf putFile) Open() (io.ReadCloser, error) { return pf.zf.Open() }
+func (pf putFile) Mode() os.FileMode            { return pf.zf.Mode() }
+
+func (fs *FS) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
+	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if err != nil && ctx0.Err() == nil {
+			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
+		}
+		if err == nil {
+			//log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %q: %w", urlStr, err)
+	}
+	res, err := fs.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download %q: %s", urlStr, res.Status)
+	}
+	return io.ReadAll(res.Body)
+}
+
+func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.ModHandle, err error) {
+	span := fs.Stats.StartSpan("get-zip-root")
+	defer func() { span.End(err) }()
+
+	rooti, err, _ := fs.sf.Do("get-zip-root:"+mv.Module+"@"+mv.Version, func() (any, error) {
+		root, err := fs.Store.GetZipRoot(ctx, mv)
+		if err == nil {
+			return root, nil
+		}
+		if !errors.Is(err, store.ErrCacheMiss) {
+			return nil, fmt.Errorf("failed to get zip root for %v: %w", mv, err)
+		}
+
+		span := fs.Stats.StartSpan("get-zip-root-cache-fill")
+		root, err = fs.downloadZip(ctx, mv)
+		span.End(err)
+		if err != nil {
+			return nil, err
+		}
+		return root, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rooti.(store.ModHandle), nil
+}
+
+func (fs *FS) getModFile(ctx context.Context, mv store.ModuleVersion) (data []byte, err error) {
+	return fs.getMetaFile(ctx, mv, "mod", fs.Store.GetModFile, fs.downloadModFile)
+}
+func (fs *FS) getInfoFile(ctx context.Context, mv store.ModuleVersion) (data []byte, err error) {
+	return fs.getMetaFile(ctx, mv, "info", fs.Store.GetInfoFile, fs.downloadInfoFile)
+}
+
+func (fs *FS) getMetaFile(ctx context.Context, mv store.ModuleVersion, ext string,
+	getFromStore,
+	downloadAndFill func(context.Context, store.ModuleVersion) ([]byte, error)) (data []byte, err error) {
+
+	v, err := getFromStore(ctx, mv)
+	if err == nil {
+		return v, nil
+	}
+	if !errors.Is(err, store.ErrCacheMiss) {
+		return nil, fmt.Errorf("failed to get %s file for %v: %w", ext, mv, err)
+	}
+	v, err = downloadAndFill(ctx, mv)
+	if err != nil {
+		log.Printf("failed to download %s for %v: %v", ext, mv, err)
+		return nil, syscall.EIO
+	}
+	return v, nil
+}
+
+func (fs *FS) getZiphash(ctx context.Context, mv store.ModuleVersion) (data []byte, err error) {
+	zr, err := fs.getZipRoot(ctx, mv)
+	if err != nil {
+		log.Printf("Failed to get zip root for %v: %v", mv, err)
+	}
+	return fs.Store.GetZipHash(ctx, zr)
 }
 
 type moduleNameNode struct {
@@ -152,7 +345,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 
 	}
 	if strings.Contains(name, "@") {
-		finalFrag, ver, _ := strings.Cut(name, "@")
+		finalFrag, escVer, _ := strings.Cut(name, "@")
 		var escName string
 		if len(n.paths) > 0 {
 			escName = strings.Join(n.paths, "/") + "/" + finalFrag
@@ -164,31 +357,20 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			log.Printf("Failed to unescape module name %q: %v", escName, err)
 			return nil, syscall.EIO
 		}
+		ver, err := module.UnescapeVersion(escVer)
+		if err != nil {
+			log.Printf("Failed to unescape version %q: %v", escVer, err)
+			return nil, syscall.EIO
+		}
 		mv := store.ModuleVersion{
 			Module:  modName,
 			Version: ver,
 		}
-		span := n.fs.Stats.StartSpan("module-name-get-repo")
-		root, err := n.fs.Store.GetZipRoot(ctx, mv)
-		span.End(err)
-		if errors.Is(err, store.ErrCacheMiss) {
-			// TODO: move faulting logic up here.
-			_, err := n.fs.Git.Get(ctx, modName+"@"+ver)
-			if err != nil {
-				log.Printf("Failed to get module %q: %v", modName, err)
-				return nil, syscall.EIO
-			}
-			root, err = n.fs.Store.GetZipRoot(ctx, mv)
-			if err != nil {
-				log.Printf("Failed to get zip root on second try: %v", err)
-				return nil, syscall.EIO
-			}
-		}
+		root, err := n.fs.getZipRoot(ctx, mv)
 		if err != nil {
 			log.Printf("Failed to get ziproot handle for module %q: %v", modName, err)
 			return nil, syscall.EIO
 		}
-		log.Printf("lookup tree: mod=%s ver=%v", modName, ver)
 		return n.NewInode(ctx, &pathUnderZipRoot{
 			fs:   n.fs,
 			mv:   mv,
@@ -217,23 +399,28 @@ type pathUnderZipRoot struct {
 	size int64       // for regular files; -1 if unknown (will require extra fetches)
 	path string      // empty for root, else "dir" or "dir/subdir"; no trailing slash
 
-	mu   sync.Mutex
-	ents []*store.Dirent
-	ent  map[string]*store.Dirent // non-nil once ents is initialized
+	mu              sync.Mutex
+	haveFileContent bool // whether fileContent is valid
+	fileContent     []byte
+	ents            []*store.Dirent
+	ent             map[string]*store.Dirent // non-nil once ents is initialized
 }
 
 var (
 	_ = (fs.NodeLookuper)((*pathUnderZipRoot)(nil))
-	//_ = (fs.NodeReaddirer)((*pathUnderZipRoot)(nil))
-	//_ = (fs.NodeReader)((*pathUnderZipRoot)(nil))
+	_ = (fs.NodeReaddirer)((*pathUnderZipRoot)(nil))
+	_ = (fs.NodeReader)((*pathUnderZipRoot)(nil))
 	_ = (fs.NodeGetattrer)((*pathUnderZipRoot)(nil))
+	_ = (fs.NodeOpener)((*pathUnderZipRoot)(nil))
 )
 
 func (n *pathUnderZipRoot) initDirEntsLocked(ctx context.Context) error {
 	if n.ent != nil {
 		return nil
 	}
+	span := n.fs.Stats.StartSpan("Store.Readdir")
 	ents, err := n.fs.Store.Readdir(ctx, n.root, n.path)
+	span.End(err)
 	if err != nil {
 		return fmt.Errorf("failed to get dir files for %q: %w", n.path, err)
 	}
@@ -252,22 +439,11 @@ func (n *pathUnderZipRoot) Getattr(ctx context.Context, h fs.FileHandle, out *fu
 	} else {
 		log.Printf("TODO: get size for %q", n.path)
 	}
-
-	var fuseMode uint32
-	if n.mode.IsDir() {
-		fuseMode = fuse.S_IFDIR | 0755
-	} else {
-		fuseMode = fuse.S_IFREG | 0644
-		if n.mode&0111 != 0 {
-			fuseMode = fuse.S_IFREG | 0755 // executable file
-		}
-	}
-
-	out.Mode = fuseMode
+	out.Mode = fuseMode(n.mode)
 	return 0
 }
 
-func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (_ *fs.Inode, errno syscall.Errno) {
 	if !n.mode.IsDir() {
 		return nil, syscall.ENOTDIR
 	}
@@ -289,15 +465,6 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 	if n.path != "" {
 		path = n.path + "/" + name
 	}
-	var fuseMode uint32
-	if ent.Mode.IsDir() {
-		fuseMode = fuse.S_IFDIR | 0755
-	} else {
-		fuseMode = fuse.S_IFREG | 0644
-		if ent.Mode&0o111 != 0 {
-			fuseMode = fuse.S_IFREG | 0755 // executable file
-		}
-	}
 	return n.NewInode(ctx, &pathUnderZipRoot{
 		fs:   n.fs,
 		mv:   n.mv,
@@ -305,7 +472,96 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 		path: path,
 		mode: ent.Mode,
 		size: ent.Size,
-	}, fs.StableAttr{Mode: fuseMode}), 0
+	}, fs.StableAttr{Mode: fuseMode(ent.Mode)}), 0
+}
+
+// fuseMode maps the limited subset of os.FileMode values that
+// Go module zip files use to FUSE file modes.
+// It's also approximately what git uses.
+// (Git can do symlinks, but Go module zip files don't.)
+func fuseMode(m os.FileMode) uint32 {
+	if m.IsDir() {
+		return fuse.S_IFDIR | 0755
+	}
+	if m&0o111 != 0 {
+		return fuse.S_IFREG | 0755 // executable file
+	}
+	return fuse.S_IFREG | 0644
+}
+
+func (n *pathUnderZipRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if err := n.initDirEntsLocked(ctx); err != nil {
+		log.Printf("Readdir(%v, %q) initDirEnts error: %v", n.mv, n.path, err)
+		return nil, syscall.EIO
+	}
+
+	ents := make([]fuse.DirEntry, len(n.ents))
+	for i, ge := range n.ents {
+		ents[i] = fuse.DirEntry{
+			Name: ge.Name,
+			Mode: fuseMode(ge.Mode),
+			Off:  uint64(i),
+		}
+	}
+	return &treeDirStream{ents: ents}, 0
+}
+
+func (n *pathUnderZipRoot) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if n.mode.IsDir() {
+		log.Printf("Open called on directory %q", n.path)
+		return nil, 0, syscall.EISDIR
+	}
+	if flags != 0 {
+		log.Printf("invalid Open(%q) with flags %x", n.path, flags)
+		return nil, 0, syscall.EINVAL
+	}
+	return nil, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func (n *pathUnderZipRoot) Read(ctx context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if n.mode.IsDir() {
+		log.Printf("Read called on directory %q", n.path)
+		return nil, syscall.EISDIR
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	span := n.fs.Stats.StartSpan("pathUnderZipRoot-Read")
+	defer span.End(nil) // TODO: track errors for stats?
+
+	if !n.haveFileContent {
+		var err error
+		span := n.fs.Stats.StartSpan("GetFile")
+		n.fileContent, err = n.fs.Store.GetFile(ctx, n.root, n.path)
+		span.End(err)
+		if err != nil {
+			log.Printf("Failed to get file %q: %v", n.path, err)
+			return nil, syscall.EIO
+		}
+		n.haveFileContent = true
+	}
+
+	if off > math.MaxInt {
+		// TODO: care about 32-bit machines? not today. but 2GB source files
+		// seem unlikely.
+		log.Printf("Read called with off %d, which is too large", off)
+		return nil, syscall.EINVAL
+	}
+
+	end := int(off) + len(dest)
+	if end < int(off) {
+		log.Printf("Read called with off %d, which is too large", off)
+		return nil, syscall.EINVAL
+	}
+
+	if end > len(n.fileContent) {
+		end = len(n.fileContent)
+	}
+	return fuse.ReadResultData(n.fileContent[int(off):end]), 0
 }
 
 type memFile struct {
@@ -590,7 +846,7 @@ var infoTmpRx = regexp.MustCompile(`\.info\d+\.tmp$`)
 
 // lookupUnderModule is Lookup for a cacheDownloadNode that's hit the /@v/
 // directory, meaning it has a module name set.
-func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (_ *fs.Inode, retErrNo syscall.Errno) {
 	// We are in the /@v/ directory, so we should return a file. e.g. one of these:
 	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
 	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.mod
@@ -604,36 +860,38 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 	switch dotExt {
 	case ".info", ".mod", ".ziphash":
 		ext := dotExt[1:] // "info", "mod", "ziphash"
-		d := n.fs.Git
-		if d == nil {
-			log.Printf("No git repo configured, cannot resolve %s for %q", ext, n.module)
-			return nil, syscall.EIO
-		}
+
+		sp := n.fs.Stats.StartSpan("get-metafile-" + ext)
+		defer func() {
+			if retErrNo != 0 {
+				sp.End(retErrNo)
+			} else {
+				sp.End(nil)
+			}
+		}()
+
 		version := strings.TrimSuffix(name, dotExt) // "v0.0.0-20240501181205-ae6ca9944745"
 		mv := store.ModuleVersion{
 			Module:  n.module,
 			Version: version,
 		}
-		// In case the module isn't downloaded yet, Get it for the side
-		// effect of downloading it and populating all the refs.
-		getRes, getErr := n.fs.Git.Get(ctx, n.module+"@"+version)
 
-		span := n.fs.Stats.StartSpan("getMetaFile-" + ext)
-		metaFile, err := d.GetMetaFile(mv, ext)
-		span.End(err)
+		var v []byte
+		var err error
+		switch ext {
+		case "mod":
+			v, err = n.fs.getModFile(ctx, mv)
+		case "info":
+			v, err = n.fs.getInfoFile(ctx, mv)
+		case "ziphash":
+			v, err = n.fs.getZiphash(ctx, mv)
+		}
 		if err != nil {
-			log.Printf("Failed to get %s for %s@%s: %v", ext, n.module, version, err)
-			if getErr != nil {
-				log.Printf("Also failed to earlier download %s@%s: %v", n.module, version, getErr)
-			} else {
-				log.Printf("Module %s@%s is %+v", n.module, version, getRes)
-			}
+			log.Printf("Failed to get %s file for %v: %v", ext, mv, err)
 			return nil, syscall.EIO
 		}
-
-		log.Printf("lookup meta: mod=%s file=%s", n.module, name)
 		in := n.NewInode(ctx, &memFile{
-			contents: []byte(metaFile),
+			contents: v,
 			mode:     0644,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFREG | 0644,
@@ -660,7 +918,8 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 }
 
 var (
-	verbose = flag.Bool("verbose", false, "enable verbose logging")
+	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
+	verbose     = flag.Bool("verbose", false, "enable verbose logging")
 )
 
 // This demonstrates how to build a file system in memory. The
@@ -676,18 +935,37 @@ func main() {
 	cmd.Dir = gitCache
 	cmd.Run() // best effort
 
-	gitStore := &gitstore.Storage{GitRepo: gitCache}
-
 	mntDir := filepath.Join(os.Getenv("HOME"), "mnt-gomodfs")
 	exec.Command("umount", mntDir).Run() // best effort
+	if os.Getenv("GOOS") == "darwin" {
+		exec.Command("diskutil", "unmount", "force", mntDir).Run() // best effort
+	}
 
 	if err := os.MkdirAll(mntDir, 0755); err != nil {
 		log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
 	}
 
+	st := &stats.Stats{}
+	gitStore := &gitstore.Storage{
+		GitRepo: gitCache,
+		Stats:   st,
+	}
 	mfs := &FS{
 		Git:   gitStore,
 		Store: gitStore,
+		Stats: st,
+	}
+
+	if *debugListen != "" {
+		ln, err := net.Listen("tcp", *debugListen)
+		if err != nil {
+			log.Fatalf("Failed to listen on %s: %v", *debugListen, err)
+		}
+		log.Printf("Debug HTTP server listening on %s", *debugListen)
+		hs := &http.Server{
+			Handler: mfs,
+		}
+		go hs.Serve(ln)
 	}
 
 	root := &moduleNameNode{
@@ -704,4 +982,8 @@ func main() {
 	log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
 
 	server.Wait()
+}
+
+func (s *FS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.Stats.ServeHTTP(w, r)
 }

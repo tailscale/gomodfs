@@ -266,6 +266,8 @@ func (fs *FS) getMetaFile(ctx context.Context, mv store.ModuleVersion, ext strin
 	getFromStore,
 	downloadAndFill func(context.Context, store.ModuleVersion) ([]byte, error)) (data []byte, err error) {
 
+	ctx = context.Background() // TODO(bradfitz): remove this after debugging FUSE/cancelation problems
+
 	v, err := getFromStore(ctx, mv)
 	if err == nil {
 		return v, nil
@@ -722,6 +724,9 @@ var infoTmpRx = regexp.MustCompile(`\.info\d+\.tmp$`)
 // lookupUnderModule is Lookup for a cacheDownloadNode that's hit the /@v/
 // directory, meaning it has a module name set.
 func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (_ *fs.Inode, retErrNo syscall.Errno) {
+
+	ctx = context.Background() // TODO(bradfitz): remove this after debugging FUSE/cancelation problems
+
 	// We are in the /@v/ directory, so we should return a file. e.g. one of these:
 	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
 	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.mod

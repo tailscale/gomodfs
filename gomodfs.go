@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -508,13 +509,24 @@ func (n *pathUnderZipRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.E
 	return &dirStream{ents: ents}, 0
 }
 
+func isReadonlyOpenFlags(flags uint32) bool {
+	if flags == 0 {
+		return true
+	}
+	if runtime.GOOS == "linux" && flags == 0x8000 {
+		// Permit O_LARGEFILE on Linux.
+		return true
+	}
+	return false
+}
+
 func (n *pathUnderZipRoot) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.mode.IsDir() {
 		log.Printf("Open called on directory %q", n.path)
 		return nil, 0, syscall.EISDIR
 	}
-	if flags != 0 {
-		log.Printf("invalid Open(%q) with flags %x", n.path, flags)
+	if !isReadonlyOpenFlags(flags) {
+		log.Printf("non-readonly open(%v %q) with flags %x", n.mv, n.path, flags)
 		return nil, 0, syscall.EINVAL
 	}
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
@@ -538,7 +550,9 @@ func (n *pathUnderZipRoot) Read(ctx context.Context, h fs.FileHandle, dest []byt
 		n.fileContent, err = n.fs.Store.GetFile(ctx, n.root, n.path)
 		span.End(err)
 		if err != nil {
-			log.Printf("Failed to get file %q: %v", n.path, err)
+			if ctx.Err() == nil {
+				log.Printf("GetFile(%v, %q) failed: %v", n.mv, n.path, err)
+			}
 			return nil, syscall.EIO
 		}
 		n.haveFileContent = true
@@ -584,9 +598,10 @@ func (f *memFile) Read(ctx context.Context, h fs.FileHandle, dest []byte, off in
 }
 
 func (f *memFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	if flags != 0 {
-		log.Printf("Open with flags %x", flags)
+	if !isReadonlyOpenFlags(flags) {
+		log.Printf("non-readonly open with flags %x", flags)
 		return nil, 0, syscall.EINVAL
+
 	}
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }

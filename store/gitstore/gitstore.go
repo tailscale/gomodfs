@@ -112,16 +112,16 @@ func (d *Storage) startRequest(req objRequest) {
 func (d *Storage) noteCatFileBatchDone(err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.catFileBatchRunning = false
 
-	sendErr := err
-	if sendErr == nil {
-		sendErr = errors.New("git cat-file process ended")
+	if len(d.pendReq) == 0 {
+		go d.runCatFileBatch()
+		select {
+		case d.wake <- true:
+		default:
+		}
+	} else {
+		d.catFileBatchRunning = false
 	}
-	for _, req := range d.pendReq {
-		req.res <- objResponse{err: sendErr}
-	}
-	d.pendReq = d.penReqArray[:0]
 }
 
 func (d *Storage) runCatFileBatch() (err error) {

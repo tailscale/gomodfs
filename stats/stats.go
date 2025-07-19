@@ -3,6 +3,8 @@ package stats
 
 import (
 	"cmp"
+	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -19,7 +21,8 @@ import (
 type OpStat struct {
 	Started  int
 	Ended    int
-	Errs     int
+	Errs     int // all errors
+	CtxErrs  int // subset of Errs where the ctx is done
 	TotalDur time.Duration
 }
 
@@ -85,6 +88,10 @@ func (s *ActiveSpan) End(err error) {
 	os.Ended++
 	if err != nil {
 		os.Errs++
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			os.CtxErrs++
+		}
 	}
 	d := time.Since(s.start)
 	os.TotalDur += d
@@ -100,17 +107,25 @@ func (st *Stats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer st.mu.Unlock()
 
 	io.WriteString(w, `<html><body cellpadding=3 border=1><table>
-	<tr><th>op</th><th>calls</th><th>pending</th><th>errs</th><th>avg</th><th>total</th></tr>
+	<tr><th align=left>op</th><th>calls</th><th>pending</th><th>errs</th><th>avg</th><th>total</th></tr>
 	`)
 
 	keys := slices.Sorted(maps.Keys(st.ops))
 	for _, op := range keys {
 		v := st.ops[op]
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%v</td><td>%v</td></tr>\n",
+		ctxErrs := ""
+		if v.Errs > 0 {
+			if v.CtxErrs > 0 {
+				ctxErrs = fmt.Sprintf("%d (%d ctx)", v.Errs, v.CtxErrs)
+			} else {
+				ctxErrs = fmt.Sprint(v.Errs)
+			}
+		}
+		fmt.Fprintf(w, "<tr><td>%s</td><td align=right>%d</td><td align=right>%d</td><td align=right>%s</td><td align=right>%v</td><td align=right>%v</td></tr>\n",
 			html.EscapeString(op),
 			v.Ended,
 			v.Started-v.Ended, // pending
-			v.Errs,
+			ctxErrs,
 			(v.TotalDur / time.Duration(cmp.Or(v.Ended, 1))).Round(time.Microsecond),
 			v.TotalDur.Round(time.Millisecond))
 	}

@@ -2,6 +2,7 @@
 package stats
 
 import (
+	"cmp"
 	"fmt"
 	"html"
 	"io"
@@ -12,10 +13,14 @@ import (
 	"time"
 )
 
+// OpStat holds statistics for a single operation type.
+//
+// All fields are guarded by the Stats.mu mutex.
 type OpStat struct {
-	Count int
-	Errs  int
-	Total time.Duration
+	Started  int
+	Ended    int
+	Errs     int
+	TotalDur time.Duration
 }
 
 type Stats struct {
@@ -25,6 +30,7 @@ type Stats struct {
 
 type ActiveSpan struct {
 	st    *Stats
+	os    *OpStat // nil if Stats is nil
 	op    string
 	start time.Time
 	done  bool
@@ -35,12 +41,29 @@ type ActiveSpan struct {
 // If s is nil, a non-nil ActiveSpan is returned that does
 // nothing when its End method is called.
 func (st *Stats) StartSpan(op string) *ActiveSpan {
-	return &ActiveSpan{
+	as := &ActiveSpan{
 		st:    st,
 		op:    op,
 		start: time.Now(),
 		done:  false,
 	}
+
+	if st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+
+		if st.ops == nil {
+			st.ops = make(map[string]*OpStat)
+		}
+		os, ok := st.ops[op]
+		if !ok {
+			os = &OpStat{}
+			st.ops[op] = os
+		}
+		as.os = os
+		os.Started++
+	}
+	return as
 }
 
 func (s *ActiveSpan) End(err error) {
@@ -49,27 +72,22 @@ func (s *ActiveSpan) End(err error) {
 	}
 	s.done = true
 
-	st := s.st
-	if st == nil {
+	st, os := s.st, s.os
+	if (st == nil) != (os == nil) {
+		panic("End called on span with mismatched st/os")
+	}
+	if os == nil {
 		return
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	op, ok := st.ops[s.op]
-	if !ok {
-		if st.ops == nil {
-			st.ops = make(map[string]*OpStat)
-		}
-		op = &OpStat{}
-		st.ops[s.op] = op
-	}
-	op.Count++
+	os.Ended++
 	if err != nil {
-		op.Errs++
+		os.Errs++
 	}
 	d := time.Since(s.start)
-	op.Total += d
+	os.TotalDur += d
 }
 
 func (st *Stats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -82,18 +100,19 @@ func (st *Stats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer st.mu.Unlock()
 
 	io.WriteString(w, `<html><body cellpadding=3 border=1><table>
-	<tr><th>op</th><th>calls</th><th>errs</th><th>avg</th><th>total</th></tr>
+	<tr><th>op</th><th>calls</th><th>pending</th><th>errs</th><th>avg</th><th>total</th></tr>
 	`)
 
 	keys := slices.Sorted(maps.Keys(st.ops))
 	for _, op := range keys {
 		v := st.ops[op]
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%v</td><td>%v</td></tr>\n",
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%v</td><td>%v</td></tr>\n",
 			html.EscapeString(op),
-			v.Count,
+			v.Ended,
+			v.Started-v.Ended, // pending
 			v.Errs,
-			(v.Total / time.Duration(v.Count)).Round(time.Millisecond),
-			v.Total.Round(time.Millisecond))
+			(v.TotalDur / time.Duration(cmp.Or(v.Ended, 1))).Round(time.Microsecond),
+			v.TotalDur.Round(time.Millisecond))
 	}
 	io.WriteString(w, `</table></body></html>`)
 }

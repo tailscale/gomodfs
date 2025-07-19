@@ -14,6 +14,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
@@ -37,6 +39,12 @@ import (
 type Storage struct {
 	Stats   *stats.Stats // or nil if stats are not enabled
 	GitRepo string
+
+	mu                  sync.Mutex
+	wake                chan bool // 1-buffered best effort wake chan
+	pendReq             []objRequest
+	penReqArray         [16]objRequest // slice backing array upon reset to length 0
+	catFileBatchRunning bool
 }
 
 // CheckExists checks that the git repo named in d.GitRepo actually exists.
@@ -48,19 +56,190 @@ func (d *Storage) CheckExists() error {
 	return nil
 }
 
-func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (_ string, retErr error) {
-	sp := d.Stats.StartSpan("gitstore-GetMetaFile-" + file)
-	defer func() { sp.End(retErr) }()
+var errMissing = errors.New("gitstore: missing object")
 
-	ref, err := refName(mv)
-	if err != nil {
-		return "", fmt.Errorf("failed to get ref name for %q: %w", mv, err)
+type objRequest struct {
+	rev string           // a git ref or hash
+	res chan objResponse // 1-buffered
+}
+
+type objResponse struct {
+	err error
+	obj object // valid only if err == nil
+}
+
+// getObject looks up the git object with the given rev (a hash or ref or
+// rev-parse expression).
+//
+// err is errMissing if the object is not found.
+func (d *Storage) getObject(ctx context.Context, rev, wantType string) (object, error) {
+	req := objRequest{
+		rev: rev,
+		res: make(chan objResponse, 1),
 	}
-	out, err := d.git("show", ref+":"+file).CombinedOutput()
-	if err != nil {
-		return "", store.ErrCacheMiss
+	d.startRequest(req)
+
+	select {
+	case <-ctx.Done():
+		return object{}, ctx.Err()
+	case res := <-req.res:
+		if res.err == nil && res.obj.typ != wantType {
+			return object{}, fmt.Errorf("expected %q (%v) to be a %q, got %q", rev, res.obj.hash, wantType, res.obj.typ)
+		}
+		return res.obj, res.err
 	}
-	return string(out), nil
+}
+
+func (d *Storage) startRequest(req objRequest) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.wake == nil {
+		d.wake = make(chan bool, 1)
+	}
+	d.pendReq = append(d.pendReq, req)
+	select {
+	case d.wake <- true:
+	default:
+	}
+
+	if !d.catFileBatchRunning {
+		d.catFileBatchRunning = true
+		go d.runCatFileBatch()
+	}
+}
+
+func (d *Storage) noteCatFileBatchDone(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.catFileBatchRunning = false
+
+	sendErr := err
+	if sendErr == nil {
+		sendErr = errors.New("git cat-file process ended")
+	}
+	for _, req := range d.pendReq {
+		req.res <- objResponse{err: sendErr}
+	}
+	d.pendReq = d.penReqArray[:0]
+}
+
+func (d *Storage) runCatFileBatch() (err error) {
+	sp := d.Stats.StartSpan("gitstore.cat-file-batch")
+	defer func() {
+		sp.End(err)
+		if err != nil {
+			log.Printf("gitstore: error running cat-file batch: %v", err)
+		}
+		d.noteCatFileBatchDone(err)
+	}()
+	cmd := d.git("cat-file", "--batch")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdin setup: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout setup: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("error starting cat-file batch: %w", err)
+	}
+
+	defer cmd.Process.Wait()
+	defer stdin.Close()
+
+	br := bufio.NewReader(stdout)
+	for {
+		req, ok := d.takePendingRequest(10 * time.Second)
+		if !ok {
+			return nil
+		}
+		sp := d.Stats.StartSpan("gitstore.cat-file-batch.request")
+		sendErr := func(err error) error {
+			sp.End(err)
+			req.res <- objResponse{err: err}
+			return err
+		}
+		if _, err := fmt.Fprintf(stdin, "%s\n", req.rev); err != nil {
+			return sendErr(fmt.Errorf("error writing to cat-file batch stdin: %w", err))
+		}
+
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			return sendErr(fmt.Errorf("error reading cat-file header line: %w", err))
+		}
+
+		f := strings.Fields(string(line))
+
+		if len(f) < 2 {
+			return sendErr(fmt.Errorf("unexpected cat-file batch output format: %q", line))
+		}
+		hash, objType := f[0], f[1]
+		if objType == "missing" {
+			req.res <- objResponse{err: errMissing}
+			continue
+		}
+		if len(f) != 3 {
+			return sendErr(fmt.Errorf("unexpected cat-file batch output format w/o 3 fields: %q", line))
+		}
+		sizeStr := f[2]
+		size, err := strconv.Atoi(sizeStr)
+		if err != nil {
+			return sendErr(fmt.Errorf("error parsing size %q in cat-file batch output: %w", sizeStr, err))
+		}
+		const maxObjSize = 512 << 20 // 512 MB seems sufficiently large for CI source
+		if size < 0 || size > maxObjSize {
+			return sendErr(fmt.Errorf("invalid size %d in cat-file batch output: %q", size, line))
+		}
+		buf := make([]byte, size+1)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return sendErr(fmt.Errorf("error reading cat-file batch output: %w", err))
+		}
+		if buf[size] != '\n' {
+			return sendErr(fmt.Errorf("cat-file batch output not terminated with newline: %q", buf[size:]))
+		}
+		buf = buf[:size]
+		select {
+		case req.res <- objResponse{obj: object{typ: objType, content: buf, hash: hash}}:
+			sp.End(nil)
+		default:
+			panic("unexpected cat-file batch response channel full")
+		}
+	}
+}
+
+func (d *Storage) takePendingRequest(timeout time.Duration) (req objRequest, ok bool) {
+	for {
+		req, wake, ok := d.tryTakePendingRequest()
+		if ok {
+			return req, true
+		}
+		select {
+		case <-wake:
+		case <-time.After(timeout):
+			return objRequest{}, false
+		}
+	}
+}
+
+func (d *Storage) tryTakePendingRequest() (req objRequest, wake <-chan bool, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.wake == nil {
+		d.wake = make(chan bool, 1)
+	}
+
+	if len(d.pendReq) > 0 {
+		req = d.pendReq[0]
+		d.pendReq = d.pendReq[1:]
+		if len(d.pendReq) == 0 {
+			d.pendReq = d.penReqArray[:0] // reset slice to empty, but keep backing array
+		}
+		return req, d.wake, true
+	}
+	return objRequest{}, d.wake, false
 }
 
 type fileInfo struct {
@@ -72,6 +251,7 @@ type fileInfo struct {
 type object struct {
 	typ     string // "blob" or "tree"
 	content []byte // binary contents of the object, after the "<type> <size>\x00" prefix
+	hash    string // optional; hex string of the SHA1 hash of the object
 }
 
 type treeBuilder struct {
@@ -419,16 +599,17 @@ type modHandle struct {
 
 	mu sync.Mutex
 	// ...
+	// TODO: pre-load contents
 }
 
 func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) ([]byte, error) {
 	tree := h.(*modHandle).modTree
 
-	out, err := s.git("show", tree+":zip/"+path).CombinedOutput()
+	obj, err := s.getObject(ctx, tree+":zip/"+path, "blob")
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return obj.content, nil
 }
 
 func (s *Storage) GetInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
@@ -439,23 +620,27 @@ func (s *Storage) GetInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []
 	if err != nil {
 		return nil, err
 	}
-	out, err := s.git("show", ref+":info").CombinedOutput()
+
+	obj, err := s.getObject(ctx, ref+":info", "blob")
 	if err == nil {
-		return out, nil
+		return obj.content, nil
 	}
+
 	// If we don't have the full module downloaded, maybe
 	// we have just the info file.
 	ref, err = infoRefName(mv)
 	if err != nil {
 		return nil, err
 	}
-	out, err = s.git("show", ref).CombinedOutput()
+
+	obj, err = s.getObject(ctx, ref, "blob")
 	if err == nil {
-		return out, nil
+		return obj.content, nil
 	}
-	// TODO: handle git error codes better; for now just map everything to
-	// ErrCacheMiss.
-	return nil, store.ErrCacheMiss
+	if errors.Is(err, errMissing) {
+		return nil, store.ErrCacheMiss
+	}
+	return nil, err
 }
 
 func (s *Storage) GetModFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
@@ -466,13 +651,14 @@ func (s *Storage) GetModFile(ctx context.Context, mv store.ModuleVersion) (_ []b
 	if err != nil {
 		return nil, err
 	}
-	out, err := s.git("show", ref).CombinedOutput()
+	out, err := s.getObject(ctx, ref, "blob")
 	if err != nil {
-		// TODO: handle git error codes better; for now just map everything to
-		// ErrCacheMiss.
-		return nil, store.ErrCacheMiss
+		if errors.Is(err, errMissing) {
+			return nil, store.ErrCacheMiss
+		}
+		return nil, err
 	}
-	return out, nil
+	return out.content, nil
 }
 
 func (s *Storage) PutModFile(ctx context.Context, mv store.ModuleVersion, data []byte) (err error) {
@@ -521,23 +707,27 @@ func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store
 	if err != nil {
 		return zero, err
 	}
-	out, err := s.git("rev-parse", ref+"^{tree}").CombinedOutput()
+	out, err := s.getObject(ctx, ref+"^{tree}", "tree")
 	if err != nil {
-		// TODO: handle git error codes better; for now just map everything to
-		// ErrCacheMiss.
-		return zero, store.ErrCacheMiss
+		if errors.Is(err, errMissing) {
+			return zero, store.ErrCacheMiss
+		}
+		return zero, fmt.Errorf("failed to get zip root tree for %q: %w", mv, err)
 	}
-	return &modHandle{modTree: strings.TrimSpace(string(out))}, nil
+	if out.hash == "" {
+		return zero, fmt.Errorf("gitstore: empty tree hash for %q", mv)
+	}
+	return &modHandle{modTree: out.hash}, nil
 }
 
 func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, error) {
 	tree := h.(*modHandle).modTree
 
-	out, err := s.git("show", tree+":ziphash").CombinedOutput()
+	out, err := s.getObject(ctx, tree+":ziphash", "blob")
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return out.content, nil
 }
 
 func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data store.PutModuleData) (store.ModHandle, error) {

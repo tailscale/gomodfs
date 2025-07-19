@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -29,7 +28,6 @@ import (
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
 	"github.com/tailscale/gomodfs/store/gitstore"
-	"go4.org/mem"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
@@ -506,7 +504,7 @@ func (n *pathUnderZipRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.E
 			Off:  uint64(i),
 		}
 	}
-	return &treeDirStream{ents: ents}, 0
+	return &dirStream{ents: ents}, 0
 }
 
 func (n *pathUnderZipRoot) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -616,158 +614,13 @@ func (f *symLink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	return f.contents, 0
 }
 
-type treeNode struct {
-	fs.Inode
-	fs   *FS
-	tree string
-
-	mu       sync.Mutex
-	treeEnt  map[string]*gitTreeEnt // non-nil once initialized
-	treeEnts []*gitTreeEnt          // non-nil once initialized
-}
-
-type gitTreeEnt struct {
-	mode    uint32
-	gitType string // "blob" (files + symlinks), "tree"
-	ref     string
-	name    string // base name
-
-	// even a symlink is:
-	// 120000 blob 996f1789ff67c0e3f69ef5933a55d54c5d0e9954    some-symlink
-}
-
-var _ fs.NodeLookuper = (*treeNode)(nil)
-var _ fs.NodeReaddirer = (*treeNode)(nil)
-
-func (n *treeNode) initEnts() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.treeEnt != nil {
-		return nil
-	}
-
-	span := n.fs.Stats.StartSpan("ls-tree")
-	cmd := exec.Command("git", "-C", n.fs.Git.GitRepo, "ls-tree", n.tree)
-	outData, err := cmd.CombinedOutput()
-	span.End(err)
-	if err != nil {
-		return fmt.Errorf("failed to list tree %q: %w", n.tree, err)
-	}
-
-	gitType := func(t mem.RO) string {
-		if t.EqualString("blob") {
-			return "blob"
-		}
-		if t.EqualString("tree") {
-			return "tree"
-		}
-		return t.StringCopy()
-	}
-
-	ents := []*gitTreeEnt{} // always non-nil
-	bs := bufio.NewScanner(bytes.NewReader(outData))
-	var f []mem.RO
-	tab := mem.S("\t")
-	for bs.Scan() {
-		modeTypeHash, name, ok := mem.Cut(mem.B(bs.Bytes()), tab)
-		if !ok {
-			return fmt.Errorf("unexpected ls-tree output: %q", bs.Text())
-		}
-		f = mem.AppendFields(f[:0], modeTypeHash)
-		if len(f) != 3 {
-			return fmt.Errorf("unexpected ls-tree output: %q", bs.Text())
-		}
-		mode, _ := mem.ParseUint(f[0], 8, 32)
-		ents = append(ents, &gitTreeEnt{
-			mode:    uint32(mode),
-			gitType: gitType(f[1]),
-			ref:     f[2].StringCopy(),
-			name:    name.StringCopy(),
-		})
-	}
-
-	n.treeEnts = ents
-	n.treeEnt = map[string]*gitTreeEnt{}
-	for _, ge := range ents {
-		n.treeEnt[ge.name] = ge
-	}
-	return nil
-}
-
-func (n *treeNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if err := n.initEnts(); err != nil {
-		log.Printf("Lookup(%q) initEnts error in tree %s: %v", name, n.tree, err)
-		return nil, syscall.EIO
-	}
-	ge, ok := n.treeEnt[name]
-	if !ok {
-		return nil, syscall.ENOENT
-	}
-	switch ge.gitType {
-	case "blob":
-		span := n.fs.Stats.StartSpan("blob-cat-file")
-		cmd := exec.Command("git", "-C", n.fs.Git.GitRepo, "cat-file", "-p", ge.ref)
-		outData, err := cmd.CombinedOutput()
-		span.End(err)
-		if err != nil {
-			log.Printf("Failed to get contents of %q in tree %q: %v", name, n.tree, err)
-			return nil, syscall.EIO
-		}
-		var node fs.InodeEmbedder
-		var mode = ge.mode & 0o777
-
-		const typBits = fuse.S_IFDIR | fuse.S_IFREG | fuse.S_IFLNK | fuse.S_IFIFO
-
-		if ge.mode&typBits == fuse.S_IFLNK {
-			mode |= fuse.S_IFLNK
-			node = &symLink{
-				mode:     ge.mode,
-				contents: outData,
-			}
-		} else {
-			mode |= fuse.S_IFREG
-			node = &memFile{
-				mode:     ge.mode,
-				contents: outData,
-			}
-		}
-		return n.Inode.NewInode(ctx, node, fs.StableAttr{Mode: mode}), 0
-	case "tree":
-		return n.Inode.NewInode(ctx, &treeNode{
-			fs:   n.fs,
-			tree: ge.ref,
-		}, fs.StableAttr{
-			Mode: fuse.S_IFDIR | 0755,
-		}), 0
-	}
-
-	log.Printf("Unknown type %q for %q in tree %q", ge.gitType, name, n.tree)
-	return nil, syscall.ENOENT
-}
-
-func (n *treeNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	if err := n.initEnts(); err != nil {
-		log.Printf("Readdir(%v) initEnts error: %v", n.tree, err)
-		return nil, syscall.EIO
-	}
-	var ents []fuse.DirEntry
-	for _, ge := range n.treeEnts {
-		ents = append(ents, fuse.DirEntry{
-			Name: ge.name,
-			Mode: ge.mode,
-			Off:  uint64(len(ents)),
-		})
-	}
-	return &treeDirStream{ents: ents}, 0
-}
-
-type treeDirStream struct {
+type dirStream struct {
 	ents []fuse.DirEntry
 }
 
-func (s *treeDirStream) HasNext() bool { return len(s.ents) > 0 }
-func (s *treeDirStream) Close()        {}
-func (s *treeDirStream) Next() (fuse.DirEntry, syscall.Errno) {
+func (s *dirStream) HasNext() bool { return len(s.ents) > 0 }
+func (s *dirStream) Close()        {}
+func (s *dirStream) Next() (fuse.DirEntry, syscall.Errno) {
 	ent := s.ents[0]
 	s.ents = s.ents[1:]
 	return ent, 0

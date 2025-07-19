@@ -1,12 +1,22 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
 	"regexp"
+	"strings"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/tailscale/gomodfs/store"
 )
 
 // tsGoRoot is Tailscale's ~/.cache/tsgo directory.
@@ -39,13 +49,15 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		return nil, syscall.ENOENT
 	}
 
-	hash, wantFile := m[1], m[2] != ""
+	hash, wantExtractedFile := m[1], m[2] != ""
 
-	treeHash, err := n.fs.Git.GetTailscaleGo(n.goos, n.goarch, hash)
+	mv, root, err := n.fs.getTailscaleGoRoot(ctx, n.goos, n.goarch, hash)
 	if err != nil {
+		log.Printf("Failed to get tailscale go root for %s/%s/%s: %v", n.goos, n.goarch, hash, err)
 		return nil, syscall.EIO
 	}
-	if wantFile {
+
+	if wantExtractedFile {
 		// If it's a file, it must be an empty file.
 		in := n.NewInode(ctx, &memFile{
 			contents: []byte{},
@@ -55,13 +67,84 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		})
 		return in, 0
 	}
-	// If it's a directory, it must be a directory with the contents of the git
-	// tree of the tsgo commit.
-	in := n.NewInode(ctx, &treeNode{
+
+	return n.NewInode(ctx, &pathUnderZipRoot{
 		fs:   n.fs,
-		tree: treeHash,
+		mv:   mv,
+		root: root,
+		mode: os.ModeDir,
 	}, fs.StableAttr{
 		Mode: fuse.S_IFDIR | 0755,
-	})
-	return in, 0
+	}), 0
+
+}
+
+// tsgoFile implements store.PutFile for a file in the tsgo root for use when
+// we're filling the Store cache from a tarball downloaded from the Tailscale Go
+// releases.
+type tsgoFile struct {
+	path    string
+	mode    os.FileMode
+	content []byte
+}
+
+func (f tsgoFile) Path() string                 { return f.path }
+func (f tsgoFile) Size() int64                  { return int64(len(f.content)) }
+func (f tsgoFile) Open() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(f.content)), nil }
+func (f tsgoFile) Mode() os.FileMode            { return f.mode }
+
+func (fs *FS) getTailscaleGoRoot(ctx context.Context, goos, goarch, commitHash string) (store.ModuleVersion, store.ModHandle, error) {
+
+	mv := store.ModuleVersion{
+		Module:  "github.com/tailscale/go",
+		Version: "tsgo-" + goos + "-" + goarch + "-" + commitHash,
+	}
+	h, err := fs.Store.GetZipRoot(ctx, mv)
+	if err == nil {
+		return mv, h, nil
+	}
+	if !errors.Is(err, store.ErrCacheMiss) {
+		return mv, nil, err
+	}
+
+	// Cache fill.
+
+	var data store.PutModuleData
+
+	// If it doesn't exist, download the tarball.
+	urlStr := fmt.Sprintf("https://github.com/tailscale/go/releases/download/build-%s/%s-%s.tar.gz", commitHash, goos, goarch)
+	log.Printf("Downloading %q", urlStr)
+	tgz, err := fs.netSlurp(ctx, urlStr)
+	if err != nil {
+		return mv, "", fmt.Errorf("failed to download %q: %w", urlStr, err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(tgz))
+	if err != nil {
+		return mv, "", fmt.Errorf("failed to gunzip tarball: %w", err)
+	}
+	tr := tar.NewReader(zr)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break // end of tar
+		}
+		if err != nil {
+			return mv, "", fmt.Errorf("failed to read tar header: %w", err)
+		}
+		if h.FileInfo().IsDir() {
+			continue
+		}
+		all, err := io.ReadAll(tr)
+		if err != nil {
+			return mv, "", fmt.Errorf("failed to read tar file %q: %w", h.Name, err)
+		}
+		data.Files = append(data.Files, tsgoFile{
+			path:    strings.TrimPrefix(h.Name, "go/"),
+			mode:    h.FileInfo().Mode(),
+			content: all,
+		})
+	}
+
+	root, err := fs.Store.PutModule(ctx, mv, data)
+	return mv, root, err
 }

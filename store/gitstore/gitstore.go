@@ -6,12 +6,9 @@
 package gitstore
 
 import (
-	"archive/tar"
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"cmp"
-	"compress/gzip"
 	"compress/zlib"
 	"context"
 	"crypto/sha1"
@@ -23,38 +20,23 @@ import (
 	"io/fs"
 	"log"
 	"maps"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
-	"golang.org/x/mod/sumdb/dirhash"
 )
 
 type Storage struct {
-	Client  *http.Client // or nil to use default client
 	Stats   *stats.Stats // or nil if stats are not enabled
 	GitRepo string
-
-	// ModuleProxyURL is the URL of the Go module proxy to use.
-	// If empty, "https://proxy.golang.org" is used.
-	// It should not have a trailing slash.
-	ModuleProxyURL string
-}
-
-type Result struct {
-	ModTree    string // hash of the git tree with "zip" tree, "ziphash"/"info"/"mod" files
-	Downloaded bool
 }
 
 // CheckExists checks that the git repo named in d.GitRepo actually exists.
@@ -64,61 +46,6 @@ func (d *Storage) CheckExists() error {
 		return fmt.Errorf("%q does not appear to be within a git directory: %v, %s", d.GitRepo, err, out)
 	}
 	return nil
-}
-
-func (d *Storage) moduleProxyURL() string {
-	if d.ModuleProxyURL != "" {
-		return strings.TrimSuffix(d.ModuleProxyURL, "/")
-	}
-	return "https://proxy.golang.org"
-}
-
-// Get gets a module like "tailscale.com@1.2.43" to the Downloader's
-// git repo, either from cache or by downloading it from the Go module proxy.
-func (d *Storage) oldGet(ctx context.Context, modAtVersion string) (_ *Result, retErr error) {
-	mod, version, ok := strings.Cut(modAtVersion, "@")
-	if !ok {
-		return nil, fmt.Errorf("module %q does not have a version", mod)
-	}
-	escMod, err := module.EscapePath(mod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to escape module name %q: %w", mod, err)
-	}
-
-	sp := d.Stats.StartSpan("git-store-legacy-get-module")
-	defer func() { sp.End(retErr) }()
-
-	// See if the ref exists first.
-	ref, err := refName(store.ModuleVersion{
-		Module:  mod,
-		Version: version,
-	})
-	if err != nil {
-		return nil, err
-	}
-	treeRef := ref + "^{tree}"
-	out, err := d.git("rev-parse", treeRef).Output()
-	if err == nil {
-		return &Result{
-			ModTree:    strings.TrimSpace(string(out)),
-			Downloaded: false,
-		}, nil
-	}
-
-	exts := map[string][]byte{}
-	for _, ext := range []string{"zip", "info", "mod"} {
-		urlStr := d.moduleProxyURL() + "/" + escMod + "/@v/" + version + "." + ext
-		sp := d.Stats.StartSpan("net-fetch-" + ext)
-		data, err := d.netSlurp(ctx, urlStr)
-		sp.End(err)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
-		}
-		exts[ext] = data
-		log.Printf("Downloaded %d bytes from %v", len(data), urlStr)
-	}
-
-	return d.addToGit(ref, modAtVersion, exts)
 }
 
 func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (_ string, retErr error) {
@@ -134,177 +61,6 @@ func (d *Storage) GetMetaFile(mv store.ModuleVersion, file string) (_ string, re
 		return "", store.ErrCacheMiss
 	}
 	return string(out), nil
-}
-
-var wordRx = regexp.MustCompile(`^\w+$`)
-
-// TreeOfRef returns the tree hash of the given ref, or ("", false) if it
-// doesn't exist.
-func (d *Storage) GetTailscaleGo(goos, goarch, commit string) (tree string, err error) {
-	for _, v := range []string{goos, goarch, commit} {
-		if !wordRx.MatchString(v) {
-			return "", fmt.Errorf("invalid value %q", v)
-		}
-	}
-
-	ref := fmt.Sprintf("refs/tsgo-%s-%s-%s", goos, goarch, commit)
-
-	// See if the ref exists first.
-	out, err := d.git("rev-parse", ref+"^{tree}").CombinedOutput()
-	if err == nil {
-		return strings.TrimSpace(string(out)), nil
-	}
-
-	// If it doesn't exist, download the tarball.
-	urlStr := fmt.Sprintf("https://github.com/tailscale/go/releases/download/build-%s/%s-%s.tar.gz", commit, goos, goarch)
-	log.Printf("Downloading %q", urlStr)
-	data, err := d.netSlurp(context.Background(), urlStr)
-	if err != nil {
-		return "", fmt.Errorf("failed to download %q: %w", urlStr, err)
-	}
-	zr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return "", fmt.Errorf("failed to gunzip tarball: %w", err)
-	}
-
-	tb := newTreeBuilder(d)
-
-	tr := tar.NewReader(zr)
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break // end of tar
-		}
-		if err != nil {
-			return "", fmt.Errorf("failed to read tar header: %w", err)
-		}
-		if h.FileInfo().IsDir() {
-			continue
-		}
-		name := strings.TrimPrefix(h.Name, "go/")
-		if err := tb.addFile(name, func() (io.ReadCloser, error) {
-			return io.NopCloser(tr), nil
-		}, h.FileInfo().Mode()); err != nil {
-			return "", fmt.Errorf("failed to add file %q from tar: %w", h.Name, err)
-		}
-		log.Printf("added %q to git tree", name)
-	}
-	treeHash, err := tb.buildTree("")
-	if err != nil {
-		log.Printf("git tree build error for %v: %v", ref, err)
-		return "", fmt.Errorf("failed to build git tree: %w", err)
-	}
-	if _, err := tb.sendToGit(); err != nil {
-		log.Printf("git sendToGit error for %v: %v", ref, err)
-	}
-
-	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
-	}
-
-	return treeHash, nil
-}
-
-func (d *Storage) addToGit(ref, modAtVersion string, parts map[string][]byte) (*Result, error) {
-	log.Printf("Adding %s to git ...", modAtVersion)
-
-	// Unzip data to git
-	zr, err := zip.NewReader(bytes.NewReader(parts["zip"]), int64(len(parts["zip"])))
-	if err != nil {
-		return nil, fmt.Errorf("failed to unzip module data: %w", err)
-	}
-
-	prefix := modAtVersion + "/"
-	tb := newTreeBuilder(d)
-
-	fileNames := make([]string, 0, len(zr.File))
-	zipOfFile := map[string]*zip.File{}
-
-	for _, f := range zr.File {
-		fileNames = append(fileNames, f.Name)
-		zipOfFile[f.Name] = f
-
-		name := f.Name
-		name = strings.TrimPrefix(name, prefix)
-		if err := tb.addFile("zip/"+name, f.Open, f.Mode()); err != nil {
-			return nil, fmt.Errorf("failed to add file %q: %w", name, err)
-		}
-	}
-
-	zipHash, err := dirhash.Hash1(fileNames, func(name string) (io.ReadCloser, error) {
-		f := zipOfFile[name]
-		if f == nil {
-			return nil, fmt.Errorf("file %q not found in zip", name) // should never happen
-		}
-		return f.Open()
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to hash zip contents: %w", err)
-	}
-
-	// Add the metadata files.
-	if err := tb.addFile("ziphash", func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader(zipHash)), nil
-	}, 0644); err != nil {
-		return nil, fmt.Errorf("failed to add ziphash file: %w", err)
-	}
-
-	// Add the info and mod files.
-	for name, contents := range parts {
-		if name == "zip" {
-			continue // already added
-		}
-		if err := tb.addFile(name, func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(contents)), nil
-		}, 0644); err != nil {
-			return nil, fmt.Errorf("failed to add file %q: %w", name, err)
-		}
-	}
-
-	treeHash, err := tb.buildTree("")
-	if err != nil {
-		return nil, fmt.Errorf("failed to build git tree: %w", err)
-	}
-	if _, err := tb.sendToGit(); err != nil {
-		log.Printf("git sendToGit error for %v: %v", ref, err)
-	}
-
-	if out, err := d.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
-	}
-
-	return &Result{
-		ModTree:    treeHash,
-		Downloaded: true,
-	}, nil
-}
-
-func (d *Storage) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err error) {
-	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
-	defer cancel()
-
-	defer func() {
-		if err != nil && ctx0.Err() == nil {
-			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
-		}
-		if err == nil {
-			log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
-		}
-	}()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request for %q: %w", urlStr, err)
-	}
-	res, err := d.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download %q: %s", urlStr, res.Status)
-	}
-	return io.ReadAll(res.Body)
 }
 
 type fileInfo struct {
@@ -618,10 +374,6 @@ func (tb *treeBuilder) dirEnts(prefix string) []dirEnt {
 	return ents
 }
 
-func (d *Storage) client() *http.Client {
-	return cmp.Or(d.Client, http.DefaultClient)
-}
-
 func (d *Storage) git(args ...string) *exec.Cmd {
 	allArgs := []string{
 		"-c", "gc.auto=0",
@@ -800,14 +552,20 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 			return io.NopCloser(bytes.NewReader(v)), nil
 		}
 	}
-	if err := tb.addFile("ziphash", static(data.ZipHash), 0644); err != nil {
-		return nil, fmt.Errorf("failed to add ziphash file: %w", err)
+	parts := map[string]*[]byte{
+		"ziphash": &data.ZipHash,
+		"info":    &data.InfoFile,
+		"mod":     &data.ModFile,
 	}
-	if err := tb.addFile("info", static(data.InfoFile), 0644); err != nil {
-		return nil, fmt.Errorf("failed to add info file: %w", err)
-	}
-	if err := tb.addFile("mod", static(data.ModFile), 0644); err != nil {
-		return nil, fmt.Errorf("failed to add mod file: %w", err)
+	for ext, sptr := range parts {
+		if *sptr == nil {
+			// Support omitting these for tsgo's (ab)use of PutModule
+			// for putting toolchain snapshots. It doesn't need these.
+			continue
+		}
+		if err := tb.addFile(ext, static(*sptr), 0644); err != nil {
+			return nil, fmt.Errorf("failed to add %s file: %w", ext, err)
+		}
 	}
 	for _, f := range data.Files {
 		if err := tb.addFile("zip/"+f.Path(), f.Open, f.Mode()); err != nil {

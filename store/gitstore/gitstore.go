@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,6 +47,12 @@ type Storage struct {
 	penReqArray         [16]objRequest // slice backing array upon reset to length 0
 	catFileBatchRunning bool
 }
+
+// objRef is a git hash to a commit, tree, blob, etc.
+type objRef [sha1.Size]byte
+
+// String returns the hex representation of the object reference.
+func (r objRef) String() string { return fmt.Sprintf("%02x", r[:]) }
 
 // CheckExists checks that the git repo named in d.GitRepo actually exists.
 func (d *Storage) CheckExists() error {
@@ -200,8 +207,12 @@ func (d *Storage) runCatFileBatch() (err error) {
 			return sendErr(fmt.Errorf("cat-file batch output not terminated with newline: %q", buf[size:]))
 		}
 		buf = buf[:size]
+		var ref objRef
+		if _, err := hex.Decode(ref[:], []byte(hash)); err != nil {
+			return sendErr(fmt.Errorf("error decoding hash %q in cat-file batch output: %w", hash, err))
+		}
 		select {
-		case req.res <- objResponse{obj: object{typ: objType, content: buf, hash: hash}}:
+		case req.res <- objResponse{obj: object{typ: objType, content: buf, hash: ref}}:
 			sp.End(nil)
 		default:
 			panic("unexpected cat-file batch response channel full")
@@ -245,21 +256,21 @@ func (d *Storage) tryTakePendingRequest() (req objRequest, wake <-chan bool, ok 
 type fileInfo struct {
 	contents []byte
 	mode     os.FileMode
-	gitHash  [sha1.Size]byte
+	gitHash  objRef
 }
 
 type object struct {
 	typ     string // "blob" or "tree"
 	content []byte // binary contents of the object, after the "<type> <size>\x00" prefix
-	hash    string // optional; hex string of the SHA1 hash of the object
+	hash    objRef
 }
 
 type treeBuilder struct {
 	d *Storage            // for git commands
 	f map[string]fileInfo // file name to contents
 
-	hashSet map[string]object
-	hashes  []string // hashes in order of addition (dependencies come first)
+	hashSet map[objRef]object
+	hashes  []objRef // hashes in order of addition (dependencies come first)
 }
 
 func newTreeBuilder(d *Storage) *treeBuilder {
@@ -267,6 +278,15 @@ func newTreeBuilder(d *Storage) *treeBuilder {
 		d: d,
 		f: make(map[string]fileInfo),
 	}
+}
+
+func mkObjRef(typ string, contents []byte) objRef {
+	s1 := sha1.New()
+	fmt.Fprintf(s1, "%s %d\x00", typ, len(contents))
+	s1.Write(contents)
+	var ref objRef
+	s1.Sum(ref[:])
+	return ref
 }
 
 func (tb *treeBuilder) addFile(name string, open func() (io.ReadCloser, error), mode os.FileMode) error {
@@ -279,70 +299,63 @@ func (tb *treeBuilder) addFile(name string, open func() (io.ReadCloser, error), 
 	if err != nil {
 		return fmt.Errorf("failed to read file %q in zip: %w", name, err)
 	}
-	s1 := sha1.New()
-	fmt.Fprintf(s1, "blob %d\x00", len(all))
-	s1.Write(all)
+	blobRef := mkObjRef("blob", all)
 
 	fi := fileInfo{
 		contents: all,
 		mode:     mode,
-		gitHash:  [sha1.Size]byte(s1.Sum(nil)),
+		gitHash:  blobRef,
 	}
 	tb.f[name] = fi
-	tb.addHash(fmt.Sprintf("%02x", fi.gitHash), "blob", all)
+	tb.addHash(blobRef, "blob", all)
 	return nil
 }
 
 // objType is "blob" or "tree".
 // contents is the binary contents of the object, before the "<type> <size>\x00" prefix.
-func (tb *treeBuilder) addHash(hash string, objType string, contents []byte) {
+func (tb *treeBuilder) addHash(hash objRef, objType string, contents []byte) {
 	if _, ok := tb.hashSet[hash]; ok {
 		return
 	}
 	if tb.hashSet == nil {
-		tb.hashSet = make(map[string]object)
+		tb.hashSet = make(map[objRef]object)
 	}
-	tb.hashSet[hash] = object{typ: objType, content: contents}
+	tb.hashSet[hash] = object{typ: objType, content: contents, hash: hash}
 	tb.hashes = append(tb.hashes, hash)
 }
 
 // prefix is "" or "dir/".
-func (tb *treeBuilder) buildTree(dir string) (string, error) {
+func (tb *treeBuilder) buildTree(dir string) (objRef, error) {
 	var buf bytes.Buffer // of binary tree
 
 	ents := tb.dirEnts(dir)
 	for _, ent := range ents {
+		if strings.ContainsAny(ent.base, "\x00/") {
+			return objRef{}, fmt.Errorf("invalid file name %q in tree: contains NUL or slash", ent.base)
+		}
 		mode := "100644"
 		if ent.isDir {
 			mode = "40000"
 		} else if ent.fi.mode&execBits != 0 {
 			mode = "100755"
 		}
-		var entHash string
+		var entHash objRef
 		if ent.isDir {
 			var err error
 			entHash, err = tb.buildTree(dir + ent.base + "/")
 			if err != nil {
-				return "", fmt.Errorf("failed to build sub-tree for %q: %w", ent.base, err)
+				return objRef{}, fmt.Errorf("failed to build sub-tree for %q: %w", ent.base, err)
 			}
 		} else {
-			entHash = fmt.Sprintf("%02x", ent.fi.gitHash)
+			entHash = ent.fi.gitHash
 		}
-		binHash, err := hex.DecodeString(entHash)
-		if err != nil || len(binHash) != sha1.Size {
-			return "", fmt.Errorf("failed to decode hash %q for %q: %w, len=%v", entHash, ent.base, err, len(binHash))
-		}
-		if strings.ContainsAny(ent.base, "\x00/") {
-			return "", fmt.Errorf("invalid file name %q in tree: contains NUL or slash", ent.base)
-		}
-		fmt.Fprintf(&buf, "%s %s\x00%s", mode, ent.base, binHash)
+		fmt.Fprintf(&buf, "%s %s\x00", mode, ent.base)
+		buf.Write(entHash[:])
 	}
 
-	s1 := sha1.New()
-	fmt.Fprintf(s1, "tree %d\x00%s", buf.Len(), buf.Bytes())
-	treeHash := fmt.Sprintf("%02x", s1.Sum(nil))
-	tb.addHash(treeHash, "tree", buf.Bytes())
-	return treeHash, nil
+	treeRef := mkObjRef("tree", buf.Bytes())
+	tb.addHash(treeRef, "tree", buf.Bytes())
+	return treeRef, nil
 }
 
 type sendToGitStats struct {
@@ -356,7 +369,11 @@ type sendToGitStats struct {
 func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 	st := &sendToGitStats{}
 	cmd := tb.d.git("cat-file", "--batch-check")
-	cmd.Stdin = strings.NewReader(strings.Join(tb.hashes, "\n") + "\n")
+	var chkBuf bytes.Buffer
+	for _, hash := range tb.hashes {
+		fmt.Fprintf(&chkBuf, "%02x\n", hash)
+	}
+	cmd.Stdin = &chkBuf
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("error setting up stdout to check existing git objects: %w", err)
@@ -364,7 +381,7 @@ func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start git cat-file: %w", err)
 	}
-	var missing []string
+	var missing []objRef
 	bs := bufio.NewScanner(stdout)
 	missingSuffix := []byte(" missing")
 	for bs.Scan() {
@@ -373,7 +390,11 @@ func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 		if !ok {
 			continue
 		}
-		missing = append(missing, string(hash))
+		var ref objRef
+		if _, err := hex.Decode(ref[:], hash); err != nil {
+			return nil, fmt.Errorf("error decoding hash %q in cat-file batch output: %w", hash, err)
+		}
+		missing = append(missing, ref)
 	}
 	if err := bs.Err(); err != nil {
 		cmd.Process.Kill()
@@ -595,17 +616,28 @@ func infoRefName(h store.ModuleVersion) (string, error) {
 }
 
 type modHandle struct {
-	modTree string
+	modTree objRef
 
-	mu sync.Mutex
-	// ...
-	// TODO: pre-load contents
+	// blobRef optionally contains the blob refs for file
+	// with the tree. (e.g. "store/gitstore/gitstore.go" => blob)
+	// If nil, the caller should fall back to getting the data
+	// otherwise.
+	// It is used for preloading data that'll probably be needed.
+	blobRef map[string]blobMeta
+
+	dirEnts map[string][]store.Dirent // path to dirEnt
+}
+
+// blobMeta is the metadata for a blob in a tree.
+type blobMeta struct {
+	Blob objRef
+	Size int64
+	Mode os.FileMode
 }
 
 func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) ([]byte, error) {
-	tree := h.(*modHandle).modTree
-
-	obj, err := s.getObject(ctx, tree+":zip/"+path, "blob")
+	mh := h.(*modHandle)
+	obj, err := s.getObject(ctx, fmt.Sprintf("%s:zip/%s", mh.modTree, path), "blob")
 	if err != nil {
 		return nil, err
 	}
@@ -701,29 +733,119 @@ func (s *Storage) PutInfoFile(ctx context.Context, mv store.ModuleVersion, data 
 	return nil
 }
 
+func fileModeFromGitOctalBytes(octal []byte) os.FileMode {
+	switch string(octal) {
+	case "040000": // tree
+		return 0755 | fs.ModeDir
+	case "100644": // blob, regular file
+		return 0644
+	case "100755": // blob, executable file
+		return 0755
+	case "120000": // symlink
+		return 0755 | fs.ModeSymlink
+	case "160000": // commit (git submodule)
+		return 0755 | fs.ModeIrregular // sure :)
+	}
+	return 0
+}
+
 func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
 	var zero mem.RO
 	ref, err := refName(mv)
 	if err != nil {
 		return zero, err
 	}
-	out, err := s.getObject(ctx, ref+"^{tree}", "tree")
+
+	treeRev := ref + "^{tree}"
+	treeObj, err := s.getObject(ctx, treeRev, "tree")
 	if err != nil {
 		if errors.Is(err, errMissing) {
 			return zero, store.ErrCacheMiss
 		}
-		return zero, fmt.Errorf("failed to get zip root tree for %q: %w", mv, err)
+		return zero, fmt.Errorf("failed to get zip root tree for %v: %w", mv, err)
 	}
-	if out.hash == "" {
-		return zero, fmt.Errorf("gitstore: empty tree hash for %q", mv)
+
+	mh := &modHandle{
+		modTree: treeObj.hash,
+		blobRef: make(map[string]blobMeta),
+		dirEnts: make(map[string][]store.Dirent),
 	}
-	return &modHandle{modTree: out.hash}, nil
+
+	out, err := s.git("ls-tree", "-t", "-r", "--format=%(objectname) %(objectmode) %(objectsize) %(path)", ref+":zip").CombinedOutput()
+	if err != nil {
+		return zero, fmt.Errorf("failed to get zip root tree for %v: %w", mv, err)
+	}
+	nl, sp := []byte{'\n'}, []byte{' '}
+	remain := out
+	for len(remain) > 0 {
+		line, rest, ok := bytes.Cut(remain, nl)
+		if !ok {
+			return zero, fmt.Errorf("unexpected git ls-tree output: %q", out)
+		}
+		remain = rest
+
+		// line is either a directory (size "-") or a file like:
+		// 3c5168bddc0916b4335d60dab404a0f7f46b3a86 040000 - cmd
+		// 7d58018ed84876cf098948dbb753707c0ff7c90f 100644 900 go.mod
+
+		// column 0: the hex object name
+		hexRef, rest, ok := bytes.Cut(line, sp)
+		if !ok {
+			return zero, fmt.Errorf("unexpected git ls-tree output: %q", line)
+		}
+		var ref objRef
+		if _, err := hex.Decode(ref[:], hexRef); err != nil {
+			return zero, fmt.Errorf("failed to decode hex in ls-tree line %q: %w", line, err)
+		}
+
+		// column 1: the object mode (040000 for tree, 100644 or 100755 for blob)
+		modeOct, rest, ok := bytes.Cut(rest, sp)
+		if !ok {
+			return zero, fmt.Errorf("unexpected git ls-tree output: %q", line)
+		}
+		mode := fileModeFromGitOctalBytes(modeOct)
+
+		// column 2: the object size (or "-" for a directory)
+		sizeStr, rest, ok := bytes.Cut(rest, sp)
+		if !ok || mode.IsDir() && string(sizeStr) != "-" {
+			return zero, fmt.Errorf("unexpected git ls-tree output: %q", line)
+		}
+		var size int64
+		if !mode.IsDir() {
+			size, err = mem.ParseInt(mem.B(sizeStr), 10, 64)
+			if err != nil {
+				return zero, fmt.Errorf("failed to parse size %q in ls-tree line %q: %w", sizeStr, line, err)
+			}
+		}
+		pathFromRoot := string(rest)
+
+		if !mode.IsDir() {
+			mh.blobRef[pathFromRoot] = blobMeta{
+				Blob: ref,
+				Size: size,
+				Mode: mode,
+			}
+		}
+
+		ent := store.Dirent{
+			Name: path.Base(pathFromRoot),
+			Mode: mode,
+			Size: size,
+		}
+
+		dir := path.Dir(pathFromRoot)
+		if dir == "." {
+			dir = ""
+		}
+		mh.dirEnts[dir] = append(mh.dirEnts[dir], ent)
+	}
+	return mh, nil
 }
 
 func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, error) {
 	tree := h.(*modHandle).modTree
 
-	out, err := s.getObject(ctx, tree+":ziphash", "blob")
+	out, err := s.getObject(ctx, tree.String()+":ziphash", "blob")
 	if err != nil {
 		return nil, err
 	}
@@ -771,7 +893,7 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 		log.Printf("git sendToGit error for %v: %v", mv, err)
 	}
 
-	if out, err := s.git("update-ref", ref, treeHash).CombinedOutput(); err != nil {
+	if out, err := s.git("update-ref", ref, treeHash.String()).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
 	}
 
@@ -779,50 +901,8 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 }
 
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {
-	tree := h.(*modHandle).modTree
-
-	out, err := s.git("ls-tree",
-		"-t", // include trees
-		"--format=%(objectmode) %(objectsize) %(path)",
-		tree+":zip/"+path).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list tree %q: %w, %s", tree, err, out)
-	}
-
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	var ents []store.Dirent
-	for sc.Scan() {
-		line := sc.Text()
-		modeStr, rest, ok := strings.Cut(line, " ")
-		if !ok {
-			return nil, fmt.Errorf("unexpected git ls-tree output: %q", line)
-		}
-		sizeStr, name, ok := strings.Cut(rest, " ")
-		if !ok {
-			return nil, fmt.Errorf("unexpected git ls-tree output: %q", line)
-		}
-		if sizeStr == "-" {
-			ents = append(ents, store.Dirent{
-				Name: name,
-				Mode: 0755 | fs.ModeDir, // only ModeDir really matters
-			})
-			continue
-		}
-		mode, err := strconv.ParseUint(modeStr, 8, 32)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse mode in line %q", line)
-		}
-		size, err := strconv.ParseInt(sizeStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse size in line %q: %w", line, err)
-		}
-		ents = append(ents, store.Dirent{
-			Name: name,
-			Mode: fs.FileMode(mode),
-			Size: size,
-		})
-	}
-	return ents, nil
+	mh := h.(*modHandle)
+	return slices.Clone(mh.dirEnts[path]), nil
 }
 
 func (s *Storage) StatFile(ctx context.Context, h store.ModHandle, path string) (_ os.FileMode, size int64, _ error) {

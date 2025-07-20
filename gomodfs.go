@@ -266,8 +266,6 @@ func (fs *FS) getMetaFile(ctx context.Context, mv store.ModuleVersion, ext strin
 	getFromStore,
 	downloadAndFill func(context.Context, store.ModuleVersion) ([]byte, error)) (data []byte, err error) {
 
-	ctx = context.Background() // TODO(bradfitz): remove this after debugging FUSE/cancelation problems
-
 	v, err := getFromStore(ctx, mv)
 	if err == nil {
 		return v, nil
@@ -312,7 +310,15 @@ func (s *moduleNameNode) OnAdd(ctx context.Context) {
 // Node types should implement some file system operations, eg. Lookup
 var _ = (fs.NodeLookuper)((*moduleNameNode)(nil))
 
+func setLongTTL(out *fuse.EntryOut) {
+	out.AttrValid = 86400
+	out.EntryValid = 86400
+}
+
 func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+
+	setLongTTL(out)
 	if len(n.paths) == 0 {
 		if name == "cache" {
 			return n.NewInode(ctx, &cacheRootNode{
@@ -441,18 +447,18 @@ func (n *pathUnderZipRoot) initDirEntsLocked(ctx context.Context) error {
 }
 
 func (n *pathUnderZipRoot) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	defer n.fs.Stats.StartSpan("pathUnderZipRoot-Getattr").End(nil)
 	out.AttrValid = 86400 * 90 // valid for 90 days
-	if n.size >= 0 {
-		out.Size = uint64(n.size)
-	} else {
-		log.Printf("TODO: get size for %q", n.path)
-	}
+	out.Size = uint64(n.size)
 	out.Mode = fuseMode(n.mode)
 	return 0
 }
 
 func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (_ *fs.Inode, errno syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+
 	if !n.mode.IsDir() {
+		log.Printf("Lookup called on non-directory %q", n.path)
 		return nil, syscall.ENOTDIR
 	}
 
@@ -463,6 +469,7 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 		log.Printf("Lookup(%v, %q, %q): %v", n.mv, n.path, name, err)
 		return nil, syscall.EIO
 	}
+	setLongTTL(out)
 
 	ent, ok := n.ent[name]
 	if !ok {
@@ -473,6 +480,7 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 	if n.path != "" {
 		path = n.path + "/" + name
 	}
+	out.Size = uint64(ent.Size)
 	return n.NewInode(ctx, &pathUnderZipRoot{
 		fs:   n.fs,
 		mv:   n.mv,
@@ -498,6 +506,8 @@ func fuseMode(m os.FileMode) uint32 {
 }
 
 func (n *pathUnderZipRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -528,7 +538,7 @@ func isReadonlyOpenFlags(flags uint32) bool {
 	return false
 }
 
-func (n *pathUnderZipRoot) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (n *pathUnderZipRoot) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.mode.IsDir() {
 		log.Printf("Open called on directory %q", n.path)
 		return nil, 0, syscall.EISDIR
@@ -540,7 +550,20 @@ func (n *pathUnderZipRoot) Open(ctx context.Context, flags uint32) (fs.FileHandl
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 
+// useGoFUSECtx, if true, makes gomodfs ignore the contexts
+// passed from go-fuse and instead just always uses context.Background().
+var useGoFUSECtx = os.Getenv("USE_GO_FUSE_CONTEXT") == "1"
+
+func maybeIgnoreIgnoreContext(ctx context.Context) context.Context {
+	if useGoFUSECtx {
+		return ctx
+	}
+	return context.Background()
+}
+
 func (n *pathUnderZipRoot) Read(ctx context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+
 	if n.mode.IsDir() {
 		log.Printf("Read called on directory %q", n.path)
 		return nil, syscall.EISDIR
@@ -597,7 +620,7 @@ var (
 	_ = (fs.NodeGetattrer)((*memFile)(nil))
 )
 
-func (f *memFile) Read(ctx context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (f *memFile) Read(_ context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	end := int(off) + len(dest)
 	if end > len(f.contents) {
 		end = len(f.contents)
@@ -605,7 +628,7 @@ func (f *memFile) Read(ctx context.Context, h fs.FileHandle, dest []byte, off in
 	return fuse.ReadResultData(f.contents[off:end]), 0
 }
 
-func (f *memFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (f *memFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if !isReadonlyOpenFlags(flags) {
 		log.Printf("non-readonly open with flags %x", flags)
 		return nil, 0, syscall.EINVAL
@@ -614,7 +637,8 @@ func (f *memFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 
-func (f *memFile) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (f *memFile) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.AttrValid = 86400 * 90 // valid forever; 90 days will do
 	out.Mode = fuse.S_IFREG | (f.mode & 0o777)
 	out.Size = uint64(len(f.contents))
 	return 0
@@ -629,12 +653,13 @@ type symLink struct {
 var _ = (fs.NodeGetattrer)((*symLink)(nil))
 var _ = (fs.NodeReadlinker)((*symLink)(nil))
 
-func (f *symLink) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (f *symLink) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.AttrValid = 86400 * 90 // valid forever; 90 days will do
 	out.Mode = fuse.S_IFLNK | (f.mode & 0o777)
 	return 0
 }
 
-func (f *symLink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+func (f *symLink) Readlink(_ context.Context) ([]byte, syscall.Errno) {
 	return f.contents, 0
 }
 
@@ -662,6 +687,9 @@ var (
 )
 
 func (n *cacheRootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+
+	setLongTTL(out)
 	if name != "download" {
 		log.Printf("Lookup(%q) in cache root, but only 'download' is allowed", name)
 		return nil, syscall.ENOENT
@@ -691,6 +719,9 @@ var (
 )
 
 func (n *cacheDownloadNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = maybeIgnoreIgnoreContext(ctx)
+	setLongTTL(out)
+
 	if n.module != "" {
 		return n.lookupUnderModule(ctx, name, out)
 	}
@@ -724,8 +755,7 @@ var infoTmpRx = regexp.MustCompile(`\.info\d+\.tmp$`)
 // lookupUnderModule is Lookup for a cacheDownloadNode that's hit the /@v/
 // directory, meaning it has a module name set.
 func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, out *fuse.EntryOut) (_ *fs.Inode, retErrNo syscall.Errno) {
-
-	ctx = context.Background() // TODO(bradfitz): remove this after debugging FUSE/cancelation problems
+	ctx = maybeIgnoreIgnoreContext(ctx)
 
 	// We are in the /@v/ directory, so we should return a file. e.g. one of these:
 	// /tmp/dl/cache/download/github.com/!microsoft/go-winio/@v/v0.6.2.info
@@ -770,6 +800,7 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 			log.Printf("Failed to get %s file for %v: %v", ext, mv, err)
 			return nil, syscall.EIO
 		}
+		out.Size = uint64(len(v))
 		in := n.NewInode(ctx, &memFile{
 			contents: v,
 			mode:     0644,

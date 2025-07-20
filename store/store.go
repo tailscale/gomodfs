@@ -58,7 +58,7 @@ type PutFile interface {
 type Dirent struct {
 	Name string      // bare name, no slashes
 	Mode os.FileMode // can be 0644 or 0 (regular files), 0755 (executable files), or fs.ModeDir; no symlinks
-	Size int64       // for regular files; -1 if unknown (will require extra fetches)
+	Size int64       // for regular files
 }
 
 type ModuleVersion struct {

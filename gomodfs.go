@@ -883,7 +883,11 @@ func main() {
 		fs: mfs,
 	}
 	server, err := fs.Mount(mntDir, root, &fs.Options{
-		MountOptions: fuse.MountOptions{Debug: *verbose},
+		MountOptions: fuse.MountOptions{
+			Debug:         *verbose,
+			FsName:        "gomodfs",
+			DisableXAttrs: true,
+		},
 	})
 	if err != nil {
 		log.Panic(err)

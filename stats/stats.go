@@ -93,7 +93,10 @@ func (s *ActiveSpan) End(err error) {
 			errors.Is(err, context.DeadlineExceeded) {
 			os.CtxErrs++
 		} else {
-			log.Printf("op %q error: %v", s.op, err)
+			errStr := err.Error()
+			if errStr != "cache miss" { // TODO(bradfitz): trashy
+				log.Printf("op %q error: %v", s.op, errStr)
+			}
 		}
 	}
 	d := time.Since(s.start)

@@ -285,7 +285,7 @@ func mkObjRef(typ string, contents []byte) objRef {
 	fmt.Fprintf(s1, "%s %d\x00", typ, len(contents))
 	s1.Write(contents)
 	var ref objRef
-	s1.Sum(ref[:])
+	s1.Sum(ref[:0])
 	return ref
 }
 
@@ -319,6 +319,10 @@ func (tb *treeBuilder) addHash(hash objRef, objType string, contents []byte) {
 	}
 	if tb.hashSet == nil {
 		tb.hashSet = make(map[objRef]object)
+	}
+	var zero objRef
+	if hash == zero {
+		panic("addHash called with zero hash")
 	}
 	tb.hashSet[hash] = object{typ: objType, content: contents, hash: hash}
 	tb.hashes = append(tb.hashes, hash)
@@ -371,7 +375,7 @@ func (tb *treeBuilder) sendToGit() (*sendToGitStats, error) {
 	cmd := tb.d.git("cat-file", "--batch-check")
 	var chkBuf bytes.Buffer
 	for _, hash := range tb.hashes {
-		fmt.Fprintf(&chkBuf, "%02x\n", hash)
+		fmt.Fprintf(&chkBuf, "%s\n", hash)
 	}
 	cmd.Stdin = &chkBuf
 	stdout, err := cmd.StdoutPipe()

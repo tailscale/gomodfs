@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -315,6 +316,14 @@ func setLongTTL(out *fuse.EntryOut) {
 	out.EntryValid = 86400
 }
 
+var procStart = time.Now()
+
+type procStat struct {
+	Filesystem string                   `json:"filesystem"`
+	Uptime     float64                  `json:"uptime"` // seconds since process start
+	Ops        map[string]*stats.OpStat `json:"ops,omitzero"`
+}
+
 func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	ctx = maybeIgnoreIgnoreContext(ctx)
 
@@ -326,6 +335,10 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 			}, fs.StableAttr{
 				Mode: fuse.S_IFDIR | 0755,
 			}), 0
+		}
+		if name == ".gomodfs-status" {
+			return n.NewInode(ctx, &statusFile{fs: n.fs},
+				fs.StableAttr{Mode: fuse.S_IFREG | 0644}), 0
 		}
 		// As a special case for Tailscale's needs unrelated to the GOMODCACHE
 		// layout (because I'm too lazy to write a separate FUSE filesystem
@@ -632,7 +645,6 @@ func (f *memFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, 
 	if !isReadonlyOpenFlags(flags) {
 		log.Printf("non-readonly open with flags %x", flags)
 		return nil, 0, syscall.EINVAL
-
 	}
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
@@ -831,6 +843,7 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 var (
 	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
 	verbose     = flag.Bool("verbose", false, "enable verbose logging")
+	useFSKit    = flag.Bool("use-fskit", false, "macOS only: use macOS FSKit instead of kernel module (see https://github.com/macfuse/macfuse/wiki/FUSE-Backends)")
 )
 
 // This demonstrates how to build a file system in memory. The
@@ -882,13 +895,20 @@ func main() {
 	root := &moduleNameNode{
 		fs: mfs,
 	}
-	server, err := fs.Mount(mntDir, root, &fs.Options{
+
+	fsOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			Debug:         *verbose,
 			FsName:        "gomodfs",
 			DisableXAttrs: true,
 		},
-	})
+	}
+	if *useFSKit && runtime.GOOS == "darwin" {
+		log.Printf("Using macOS FSKit backend...")
+		fsOpts.Options = append(fsOpts.Options, "backend=fskit")
+	}
+
+	server, err := fs.Mount(mntDir, root, fsOpts)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -901,4 +921,49 @@ func main() {
 
 func (s *FS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Stats.ServeHTTP(w, r)
+}
+
+type statusFile struct {
+	fs.Inode
+	fs *FS
+}
+
+func (n *statusFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	stj, _ := json.MarshalIndent(procStat{
+		Filesystem: "gomodfs",
+		Uptime:     time.Since(procStart).Seconds(),
+		Ops:        n.fs.Stats.Clone(),
+	}, "", "  ")
+	stj = append(stj, '\n')
+	return &statusFH{json: stj}, fuse.FOPEN_DIRECT_IO, 0
+}
+
+type statusFH struct {
+	json []byte
+}
+
+func (f *statusFile) Read(_ context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	fh, ok := h.(*statusFH)
+	if !ok {
+		log.Printf("statusFile.Getattr called with non-statusFH handle %T", h)
+		return fuse.ReadResultData(nil), syscall.EIO
+	}
+	end := int(off) + len(dest)
+	if end > len(fh.json) {
+		end = len(fh.json)
+	}
+	return fuse.ReadResultData(fh.json[off:end]), 0
+}
+
+func (f *statusFile) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	fh, ok := h.(*statusFH)
+
+	out.AttrValid = 1
+	out.Mode = fuse.S_IFREG | 0644
+	if !ok {
+		out.Size = 123 // just a placeholder; we don't know the size yet
+	} else {
+		out.Size = uint64(len(fh.json))
+	}
+	return 0
 }

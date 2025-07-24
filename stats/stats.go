@@ -27,9 +27,31 @@ type OpStat struct {
 	TotalDur time.Duration
 }
 
+// Stats holds the operation statistics for the gomodfs file system.
+//
+// If nil, no statistics are collected.
 type Stats struct {
 	mu  sync.Mutex
 	ops map[string]*OpStat
+}
+
+// Clone returns a clone of the current operation statistics,
+// keyed by operation name.
+//
+// If st is nil, it returns nil. Otherwise it returns a non-nil map.
+func (st *Stats) Clone() map[string]*OpStat {
+	if st == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	clone := make(map[string]*OpStat, len(st.ops))
+	for k, v := range st.ops {
+		shallowCopy := *v // shallow copy
+		clone[k] = &shallowCopy
+	}
+	return clone
 }
 
 type ActiveSpan struct {

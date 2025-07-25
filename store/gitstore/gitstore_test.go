@@ -1,7 +1,6 @@
 package gitstore
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"reflect"
@@ -9,32 +8,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestModgit(t *testing.T) {
-	gitDir := t.TempDir()
-
-	var d Storage
-	d.GitRepo = gitDir
-
-	if err := d.git("init").Run(); err != nil {
-		t.Fatalf("git init: %v", err)
-	}
-
-	const mod = "github.com/shurcooL/githubv4@v0.0.0-20240727222349-48295856cce7"
-
-	ctx := context.Background()
-	res, err := d.oldGet(ctx, mod)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if !res.Downloaded {
-		t.Fatalf("expected module to be downloaded, got %v", res)
-	}
-	t.Logf("Tree: %s", res.ModTree)
-
-	out, err := d.git("cat-file", "-p", res.ModTree).Output()
-	t.Logf("Got %v:\n%s", err, out)
-}
 
 func TestTreeBuilder(t *testing.T) {
 	gitDir := t.TempDir()
@@ -71,8 +44,9 @@ func TestTreeBuilder(t *testing.T) {
 			t.Fatalf("addTree: %v", err)
 		}
 		const want = "66ee1f462ae592ba00fc845aa1d70d0f12e688fb"
-		if treeHash != want {
-			t.Fatalf("got treeHash %q, want %q", treeHash, want)
+		got := fmt.Sprint(treeHash)
+		if got != want {
+			t.Fatalf("got treeHash %q, want %q", got, want)
 		}
 
 		if st, err := tb.sendToGit(); err != nil {
@@ -91,9 +65,9 @@ func TestTreeBuilder(t *testing.T) {
 		}
 
 		if pass == 0 {
-			got, err := d.git("cat-file", "-p", treeHash).Output()
+			got, err := d.git("cat-file", "-p", treeHash.String()).Output()
 			if err != nil {
-				t.Fatalf("git cat-file -p %s: %v", treeHash, err)
+				t.Fatalf("git cat-file -p %s: %v", treeHash.String(), err)
 			}
 			t.Logf("got: %s", got)
 		}

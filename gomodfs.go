@@ -843,7 +843,6 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 var (
 	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
 	verbose     = flag.Bool("verbose", false, "enable verbose logging")
-	useFSKit    = flag.Bool("use-fskit", false, "macOS only: use macOS FSKit instead of kernel module (see https://github.com/macfuse/macfuse/wiki/FUSE-Backends)")
 )
 
 // This demonstrates how to build a file system in memory. The
@@ -902,10 +901,6 @@ func main() {
 			FsName:        "gomodfs",
 			DisableXAttrs: true,
 		},
-	}
-	if *useFSKit && runtime.GOOS == "darwin" {
-		log.Printf("Using macOS FSKit backend...")
-		fsOpts.Options = append(fsOpts.Options, "backend=fskit")
 	}
 
 	server, err := fs.Mount(mntDir, root, fsOpts)

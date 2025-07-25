@@ -1,4 +1,4 @@
-package main
+package gomodfs
 
 import (
 	"archive/zip"
@@ -7,15 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -840,80 +837,6 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 	return nil, syscall.EIO
 }
 
-var (
-	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
-	verbose     = flag.Bool("verbose", false, "enable verbose logging")
-)
-
-// This demonstrates how to build a file system in memory. The
-// read/write logic for the file is provided by the MemRegularFile type.
-func main() {
-	flag.Parse()
-
-	gitCache := filepath.Join(os.Getenv("HOME"), ".cache", "gomodfs")
-	if err := os.MkdirAll(gitCache, 0755); err != nil {
-		log.Panicf("Failed to create git cache directory %s: %v", gitCache, err)
-	}
-	cmd := exec.Command("git", "init", gitCache)
-	cmd.Dir = gitCache
-	cmd.Run() // best effort
-
-	mntDir := filepath.Join(os.Getenv("HOME"), "mnt-gomodfs")
-	exec.Command("umount", mntDir).Run() // best effort
-	if os.Getenv("GOOS") == "darwin" {
-		exec.Command("diskutil", "unmount", "force", mntDir).Run() // best effort
-	}
-
-	if err := os.MkdirAll(mntDir, 0755); err != nil {
-		log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
-	}
-
-	st := &stats.Stats{}
-	gitStore := &gitstore.Storage{
-		GitRepo: gitCache,
-		Stats:   st,
-	}
-	mfs := &FS{
-		Git:   gitStore,
-		Store: gitStore,
-		Stats: st,
-	}
-
-	if *debugListen != "" {
-		ln, err := net.Listen("tcp", *debugListen)
-		if err != nil {
-			log.Fatalf("Failed to listen on %s: %v", *debugListen, err)
-		}
-		log.Printf("Debug HTTP server listening on %s", *debugListen)
-		hs := &http.Server{
-			Handler: mfs,
-		}
-		go hs.Serve(ln)
-	}
-
-	root := &moduleNameNode{
-		fs: mfs,
-	}
-
-	fsOpts := &fs.Options{
-		MountOptions: fuse.MountOptions{
-			Debug:         *verbose,
-			FsName:        "gomodfs",
-			DisableXAttrs: true,
-		},
-	}
-
-	server, err := fs.Mount(mntDir, root, fsOpts)
-	if err != nil {
-		log.Panic(err)
-	}
-
-	log.Printf("Mounted on %s", mntDir)
-	log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
-
-	server.Wait()
-}
-
 func (s *FS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Stats.ServeHTTP(w, r)
 }
@@ -961,4 +884,37 @@ func (f *statusFile) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrO
 		out.Size = uint64(len(fh.json))
 	}
 	return 0
+}
+
+type FuseOpts struct {
+	Debug bool // if true, enables debug logging
+}
+
+type FileServer interface {
+	Unmount() error
+	Wait()
+}
+
+func (f *FS) MountFUSE(mntPoint string, opt *FuseOpts) (FileServer, error) {
+	root := &moduleNameNode{
+		fs: f,
+	}
+	if opt == nil {
+		opt = &FuseOpts{}
+	}
+
+	fsOpts := &fs.Options{
+		MountOptions: fuse.MountOptions{
+			Debug:         opt.Debug,
+			FsName:        "gomodfs",
+			DisableXAttrs: true,
+		},
+	}
+
+	server, err := fs.Mount(mntPoint, root, fsOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	return server, nil
 }

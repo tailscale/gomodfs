@@ -1,4 +1,4 @@
-package main
+package gomodfs
 
 import (
 	"archive/tar"
@@ -56,6 +56,8 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		log.Printf("Failed to get tailscale go root for %s/%s/%s: %v", n.goos, n.goarch, hash, err)
 		return nil, syscall.EIO
 	}
+
+	setLongTTL(out)
 
 	if wantExtractedFile {
 		// If it's a file, it must be an empty file.

@@ -9,6 +9,8 @@ import (
 
 var ErrCacheMiss = errors.New("cache miss")
 
+var ErrIsDir = errors.New("is a directory")
+
 // Store defines the cache storage interface for gomodfs.
 type Store interface {
 	// GetZipRoot returns a handle to the root of a module's zip file for a given version.
@@ -23,9 +25,12 @@ type Store interface {
 
 	GetZipHash(context.Context, ModHandle) ([]byte, error) // but _not_ ErrCacheMiss
 
-	// path is  "foo.txt" or "foo/bar.txt"
+	// GetFile returns the contents of a file within the zip file.
+	// If the file does not exist, it should return os.ErrNotExist.
+	// If the file is a directory, it should return ErrIsDir.
+	//
+	// The path is  "foo.txt" or "foo/bar.txt or "" for the root directory.
 	GetFile(ctx context.Context, h ModHandle, path string) ([]byte, error)
-	StatFile(ctx context.Context, h ModHandle, path string) (_ os.FileMode, size int64, _ error)
 
 	// path is "" for root, else "foo" or "foo/bar" (no trailing slash)
 	Readdir(ctx context.Context, h ModHandle, path string) ([]Dirent, error)

@@ -11,14 +11,18 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +33,7 @@ import (
 	"github.com/tailscale/gomodfs/store/gitstore"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
+	"golang.org/x/net/webdav"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -46,6 +51,14 @@ type FS struct {
 	// If empty, "https://proxy.golang.org" is used.
 	// It should not have a trailing slash.
 	ModuleProxyURL string
+
+	mu           sync.RWMutex
+	zipRootCache map[store.ModuleVersion]modHandleCacheEntry
+}
+
+type modHandleCacheEntry struct {
+	h        store.ModHandle
+	lastUsed *atomic.Int64 // unix seconds
 }
 
 func (fs *FS) client() *http.Client {
@@ -204,9 +217,6 @@ func (fs *FS) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err err
 		if err != nil && ctx0.Err() == nil {
 			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
 		}
-		if err == nil {
-			//log.Printf("netSlurp(%q) succeeded; %d bytes", urlStr, len(ret))
-		}
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
@@ -224,15 +234,52 @@ func (fs *FS) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err err
 	return io.ReadAll(res.Body)
 }
 
+func (fs *FS) getZipRootCached(mv store.ModuleVersion) (mh store.ModHandle, ok bool) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	ent, ok := fs.zipRootCache[mv]
+	if !ok {
+		return nil, false
+	}
+	ent.lastUsed.Store(time.Now().Unix())
+	return ent.h, true
+}
+
+func (fs *FS) setZipRootCache(mv store.ModuleVersion, h store.ModHandle) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.zipRootCache == nil {
+		fs.zipRootCache = make(map[store.ModuleVersion]modHandleCacheEntry)
+	}
+	now := new(atomic.Int64)
+	now.Store(time.Now().Unix())
+	fs.zipRootCache[mv] = modHandleCacheEntry{
+		h:        h,
+		lastUsed: now,
+	}
+	log.Printf("added zip root for %v to cache", mv)
+}
+
 func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.ModHandle, err error) {
+	mh, ok := fs.getZipRootCached(mv)
+	if ok {
+		return mh, nil
+	}
+
 	span := fs.Stats.StartSpan("get-zip-root")
 	defer func() { span.End(err) }()
 
 	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
 
 	rooti, err, _ := fs.sf.Do("get-zip-root:"+mv.Module+"@"+mv.Version, func() (any, error) {
+		mh, ok := fs.getZipRootCached(mv)
+		if ok {
+			return mh, nil
+		}
+
 		root, err := fs.Store.GetZipRoot(ctx, mv)
 		if err == nil {
+			fs.setZipRootCache(mv, root)
 			return root, nil
 		}
 		if !errors.Is(err, store.ErrCacheMiss) {
@@ -245,12 +292,27 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 		if err != nil {
 			return nil, err
 		}
+
+		fs.setZipRootCache(mv, root)
 		return root, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return rooti.(store.ModHandle), nil
+}
+
+// ext is one of "mod", "ziphash", "info".
+func (fs *FS) getMetaFileByExt(ctx context.Context, mv store.ModuleVersion, ext string) ([]byte, error) {
+	switch ext {
+	case "mod":
+		return fs.getModFile(ctx, mv)
+	case "ziphash":
+		return fs.getZiphash(ctx, mv)
+	case "info":
+		return fs.getInfoFile(ctx, mv)
+	}
+	return nil, fmt.Errorf("unknown meta file extension %q", ext)
 }
 
 func (fs *FS) getModFile(ctx context.Context, mv store.ModuleVersion) (data []byte, err error) {
@@ -795,16 +857,7 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 			Version: version,
 		}
 
-		var v []byte
-		var err error
-		switch ext {
-		case "mod":
-			v, err = n.fs.getModFile(ctx, mv)
-		case "info":
-			v, err = n.fs.getInfoFile(ctx, mv)
-		case "ziphash":
-			v, err = n.fs.getZiphash(ctx, mv)
-		}
+		v, err := n.fs.getMetaFileByExt(ctx, mv, ext)
 		if err != nil {
 			log.Printf("Failed to get %s file for %v: %v", ext, mv, err)
 			return nil, syscall.EIO
@@ -886,7 +939,10 @@ func (f *statusFile) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrO
 	return 0
 }
 
-type FuseOpts struct {
+// MountOpts are options for mounting the gomodfs filesystem.
+//
+// A nil value is equivalent to the zero value.
+type MountOpts struct {
 	Debug bool // if true, enables debug logging
 }
 
@@ -895,12 +951,12 @@ type FileServer interface {
 	Wait()
 }
 
-func (f *FS) MountFUSE(mntPoint string, opt *FuseOpts) (FileServer, error) {
+func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (FileServer, error) {
 	root := &moduleNameNode{
 		fs: f,
 	}
 	if opt == nil {
-		opt = &FuseOpts{}
+		opt = &MountOpts{}
 	}
 
 	fsOpts := &fs.Options{
@@ -917,4 +973,65 @@ func (f *FS) MountFUSE(mntPoint string, opt *FuseOpts) (FileServer, error) {
 	}
 
 	return server, nil
+}
+
+func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("gomodfs: WebDAV mount is currently only supported on macOS")
+	}
+
+	// Configure the WebDAV handler.
+	h := &webdav.Handler{
+		Prefix: "/", // serve at the root
+		FileSystem: webdavFS{
+			fs:      f,
+			verbose: opt != nil && opt.Debug,
+		}, // our read‑only FS
+		LockSystem: webdav.NewMemLS(), // simple in‑memory locks
+	}
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		return nil, fmt.Errorf("gomodfs: failed to listen on port: %w", err)
+	}
+	hs := &http.Server{
+		Handler: h,
+	}
+	go hs.Serve(ln)
+
+	out, err := exec.Command("/sbin/mount_webdav",
+		"-v", "gomodfs",
+		"http://localhost:"+strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+		mntPoint).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("gomodfs: failed to mount WebDAV: %w; output: %s", err, out)
+	}
+	log.Printf("gomodfs: mounted WebDAV at %s", mntPoint)
+
+	mt := &webdavMount{ln: ln, path: mntPoint}
+	mt.ctx, mt.cancel = context.WithCancel(context.Background())
+	return mt, nil
+}
+
+type webdavMount struct {
+	path string
+	ln   net.Listener
+
+	cancel context.CancelFunc
+	ctx    context.Context
+}
+
+func (mt *webdavMount) Unmount() error {
+	mt.cancel()
+	if err := mt.ln.Close(); err != nil {
+		return fmt.Errorf("gomodfs: failed to close WebDAV listener: %w", err)
+	}
+	out, err := exec.Command("/sbin/umount", mt.path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gomodfs: failed to unmount WebDAV: %w; %s", err, out)
+	}
+	return nil
+}
+
+func (mt *webdavMount) Wait() {
+	<-mt.ctx.Done()
 }

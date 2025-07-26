@@ -17,6 +17,7 @@ import (
 var (
 	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
 	verbose     = flag.Bool("verbose", false, "enable verbose logging")
+	useWebDAV   = flag.Bool("webdav", false, "use WebDAV instead of FUSE (useful on macOS w/o kernel extensions allowed)")
 )
 
 // This demonstrates how to build a file system in memory. The
@@ -65,9 +66,17 @@ func main() {
 		go hs.Serve(ln)
 	}
 
-	fuseSrv, err := mfs.MountFUSE(mntDir, &gomodfs.FuseOpts{
-		Debug: *verbose,
-	})
+	var err error
+	var mount gomodfs.FileServer
+	if *useWebDAV {
+		mount, err = mfs.MountWebDAV(mntDir, &gomodfs.MountOpts{
+			Debug: *verbose,
+		})
+	} else {
+		mount, err = mfs.MountFUSE(mntDir, &gomodfs.MountOpts{
+			Debug: *verbose,
+		})
+	}
 	if err != nil {
 		log.Fatalf("Failed to mount filesystem: %v", err)
 	}
@@ -75,5 +84,5 @@ func main() {
 	log.Printf("Mounted on %s", mntDir)
 	log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
 
-	fuseSrv.Wait()
+	mount.Wait()
 }

@@ -641,8 +641,16 @@ type blobMeta struct {
 
 func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) ([]byte, error) {
 	mh := h.(*modHandle)
+
+	if _, ok := mh.dirEnts[path]; ok {
+		return nil, store.ErrIsDir
+	}
+
 	obj, err := s.getObject(ctx, fmt.Sprintf("%s:zip/%s", mh.modTree, path), "blob")
 	if err != nil {
+		if errors.Is(err, errMissing) {
+			return nil, os.ErrNotExist
+		}
 		return nil, err
 	}
 	return obj.content, nil
@@ -907,8 +915,4 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {
 	mh := h.(*modHandle)
 	return slices.Clone(mh.dirEnts[path]), nil
-}
-
-func (s *Storage) StatFile(ctx context.Context, h store.ModHandle, path string) (_ os.FileMode, size int64, _ error) {
-	panic("TODO")
 }

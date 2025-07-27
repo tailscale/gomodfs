@@ -762,7 +762,7 @@ func fileModeFromGitOctalBytes(octal []byte) os.FileMode {
 }
 
 func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
-	var zero mem.RO
+	var zero store.ModHandle
 	ref, err := refName(mv)
 	if err != nil {
 		return zero, err

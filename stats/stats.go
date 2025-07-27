@@ -98,22 +98,22 @@ func (s *ActiveSpan) End(err error) {
 	}
 	s.done = true
 
-	st, os := s.st, s.os
-	if (st == nil) != (os == nil) {
+	st, ost := s.st, s.os
+	if (st == nil) != (ost == nil) {
 		panic("End called on span with mismatched st/os")
 	}
-	if os == nil {
+	if ost == nil {
 		return
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	os.Ended++
+	ost.Ended++
 	if err != nil {
-		os.Errs++
+		ost.Errs++
 		if errors.Is(err, context.Canceled) ||
 			errors.Is(err, context.DeadlineExceeded) {
-			os.CtxErrs++
+			ost.CtxErrs++
 		} else {
 			errStr := err.Error()
 			if errStr != "cache miss" { // TODO(bradfitz): trashy
@@ -122,7 +122,7 @@ func (s *ActiveSpan) End(err error) {
 		}
 	}
 	d := time.Since(s.start)
-	os.TotalDur += d
+	ost.TotalDur += d
 }
 
 func (st *Stats) ServeHTTP(w http.ResponseWriter, r *http.Request) {

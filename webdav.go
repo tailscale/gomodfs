@@ -156,8 +156,15 @@ func parseModVersion(escMod, escVer string) (mv store.ModuleVersion, ok bool) {
 }
 
 func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr error) {
+	base := path.Base(name)
 	sp := d.fs.Stats.StartSpan("webdav.Stat")
-	defer func() { sp.End(retErr) }()
+	defer func() {
+		spErr := retErr
+		if errors.Is(spErr, os.ErrNotExist) {
+			spErr = nil // don't count not-found errors
+		}
+		sp.End(spErr)
+	}()
 
 	if d.verbose {
 		defer func() {
@@ -188,7 +195,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		sp := d.fs.Stats.StartSpan("webdav.Stat-not-zip")
 		sp.End(nil)
 		// Guess we're still building a directory.
-		return dirFileInfo{}, nil
+		return dirFileInfo{baseName: base}, nil
 	}
 
 	mh, err := d.fs.getZipRoot(ctx, dp.ModVersion)
@@ -200,7 +207,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 	if err != nil {
 		if errors.Is(err, store.ErrIsDir) {
 			spGF.End(nil)
-			return dirFileInfo{}, nil
+			return dirFileInfo{baseName: base}, nil
 		}
 		if errors.Is(err, os.ErrNotExist) {
 			spGF.End(nil)
@@ -225,6 +232,7 @@ func newWDFileFromContents(name string, contents []byte) webdav.File {
 }
 
 func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (retFile webdav.File, retErr error) {
+	base := path.Base(name)
 	sp := d.fs.Stats.StartSpan("webdav.OpenFile")
 	defer func() { sp.End(retErr) }()
 
@@ -262,7 +270,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 
 	if !dp.InZip {
 		d.fs.Stats.StartSpan("webdav.OpenFile-not-zip").End(nil)
-		return &emptyDir{fs: d.fs}, nil
+		return &emptyDir{fs: d.fs, baseName: base}, nil
 	}
 
 	mh, err := d.fs.getZipRoot(ctx, dp.ModVersion)
@@ -281,7 +289,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 				return nil, err
 			}
 			spanGF.End(nil)
-			return wdDir{ents: ents}, nil
+			return wdDir{pathInZip: dp.Path, baseName: base, ents: ents}, nil
 		}
 		spanGF.End(err)
 		return nil, err
@@ -336,11 +344,13 @@ func (wd wdRegularFile) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 // wdDir is a [webdav.File] implementation that represents a directory
 // in the gomodfs store.
 type wdDir struct {
-	ents []store.Dirent
+	pathInZip string // the path within the zip file, for debug logs
+	baseName  string
+	ents      []store.Dirent
 }
 
 func (wd wdDir) Stat() (os.FileInfo, error) {
-	return dirFileInfo{}, nil
+	return dirFileInfo{baseName: wd.baseName}, nil
 }
 
 func (wd wdDir) Close() error                   { return nil }
@@ -354,7 +364,7 @@ func (wd wdDir) Readdir(count int) ([]fs.FileInfo, error) {
 	fis := make([]fs.FileInfo, len(wd.ents))
 	for i, ent := range wd.ents {
 		if ent.Mode.IsDir() {
-			fis[i] = dirFileInfo{}
+			fis[i] = dirFileInfo{baseName: ent.Name}
 		} else {
 			fis[i] = regFileInfo{name: ent.Name, size: ent.Size}
 		}
@@ -385,11 +395,18 @@ func (r regFileInfo) ModTime() time.Time { return fakeStaticFileTime }
 func (r regFileInfo) IsDir() bool        { return false }
 func (r regFileInfo) Sys() any           { return nil }
 
-type dirFileInfo struct{}
+type dirFileInfo struct {
+	baseName string
+}
 
-func (dirFileInfo) Name() string       { return "/" }
-func (dirFileInfo) Size() int64        { return 0 }
+func (d dirFileInfo) Name() string {
+	if d.baseName == "" {
+		panic("dirFileInfo.Name called with empty baseName")
+	}
+	return d.baseName
+}
 func (dirFileInfo) Mode() os.FileMode  { return os.ModeDir | 0555 }
+func (dirFileInfo) Size() int64        { return 0 }
 func (dirFileInfo) ModTime() time.Time { return fakeStaticFileTime }
 func (dirFileInfo) IsDir() bool        { return true }
 func (dirFileInfo) Sys() any           { return nil }
@@ -397,11 +414,12 @@ func (dirFileInfo) Sys() any           { return nil }
 type emptyDir struct {
 	fs *FS
 
+	baseName string
 	webdav.File
 }
 
 func (ed *emptyDir) Stat() (os.FileInfo, error) {
-	return dirFileInfo{}, nil
+	return dirFileInfo{baseName: ed.baseName}, nil
 }
 
 func (ed *emptyDir) Close() error { return nil }
@@ -410,7 +428,7 @@ func (ed *emptyDir) Readdir(count int) ([]fs.FileInfo, error) {
 	return nil, nil
 }
 
-var _ webdav.DeadPropsHolder = &emptyDir{}
+var _ webdav.DeadPropsHolder = (*emptyDir)(nil)
 
 func (ed *emptyDir) DeadProps() (map[xml.Name]webdav.Property, error) {
 	return staticDeadProps, nil

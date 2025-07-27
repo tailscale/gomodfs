@@ -777,13 +777,19 @@ func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store
 		return zero, fmt.Errorf("failed to get zip root tree for %v: %w", mv, err)
 	}
 
+	return s.newModeHandle(mv, treeObj.hash)
+}
+
+func (s *Storage) newModeHandle(mv store.ModuleVersion, modTree objRef) (store.ModHandle, error) {
+	var zero store.ModHandle
+
 	mh := &modHandle{
-		modTree: treeObj.hash,
+		modTree: modTree,
 		blobRef: make(map[string]blobMeta),
 		dirEnts: make(map[string][]store.Dirent),
 	}
 
-	out, err := s.git("ls-tree", "-t", "-r", "--format=%(objectname) %(objectmode) %(objectsize) %(path)", ref+":zip").CombinedOutput()
+	out, err := s.git("ls-tree", "-t", "-r", "--format=%(objectname) %(objectmode) %(objectsize) %(path)", modTree.String()+":zip").CombinedOutput()
 	if err != nil {
 		return zero, fmt.Errorf("failed to get zip root tree for %v: %w", mv, err)
 	}
@@ -909,7 +915,7 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
 	}
 
-	return &modHandle{modTree: treeHash}, nil
+	return s.newModeHandle(mv, treeHash)
 }
 
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {

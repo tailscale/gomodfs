@@ -3,6 +3,7 @@ package gomodfs
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -170,7 +171,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return nil, os.ErrNotExist
 	}
 	if dp.WellKnown != "" {
-		return regFileWithSize{name: name, size: 123}, nil
+		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
 		sp := d.fs.Stats.StartSpan("webdav.Stat-ext-" + ext)
@@ -180,7 +181,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 			log.Printf("Failed to get %s file for %v: %v", dp.CacheDownloadFileExt, dp.ModVersion, err)
 			return nil, syscall.EIO
 		}
-		return regFileWithSize{name: name, size: int64(len(v))}, nil
+		return regFileInfo{name: name, size: int64(len(v))}, nil
 	}
 
 	if !dp.InZip {
@@ -210,7 +211,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return nil, err
 	}
 	spGF.End(nil)
-	return regFileWithSize{name: name, size: int64(len(contents))}, nil
+	return regFileInfo{name: name, size: int64(len(contents))}, nil
 }
 
 func newWDFileFromContents(name string, contents []byte) webdav.File {
@@ -297,7 +298,7 @@ type wdRegularFile struct {
 }
 
 func (wd wdRegularFile) Stat() (os.FileInfo, error) {
-	return regFileWithSize{name: wd.path, size: wd.size}, nil
+	return regFileInfo{name: wd.path, size: wd.size}, nil
 }
 
 func (wdRegularFile) Readdir(count int) ([]fs.FileInfo, error) {
@@ -306,6 +307,30 @@ func (wdRegularFile) Readdir(count int) ([]fs.FileInfo, error) {
 
 func (wdRegularFile) Write([]byte) (int, error) {
 	return 0, os.ErrInvalid
+}
+
+var creationDateProp = xml.Name{Space: "DAV:", Local: "creationdate"}
+
+var (
+	fakeStaticFileTime = time.Date(2009, 11, 12, 13, 14, 15, 0, time.UTC)
+)
+
+var staticDeadProps = map[xml.Name]webdav.Property{
+	creationDateProp: {
+		XMLName:  creationDateProp,
+		InnerXML: []byte("<D:creationdate xmlns:D=\"DAV:\">" + fakeStaticFileTime.Format(time.RFC3339) + "</D:creationdate>"),
+	},
+}
+
+// Implement DeadPropsHolder so we can set a creation date, which macOS maybe
+// reportedly expects? It at least asks for it.
+var _ webdav.DeadPropsHolder = wdRegularFile{}
+
+func (wd wdRegularFile) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return staticDeadProps, nil
+}
+func (wd wdRegularFile) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
+	return nil, webdav.ErrNotImplemented
 }
 
 // wdDir is a [webdav.File] implementation that represents a directory
@@ -331,30 +356,41 @@ func (wd wdDir) Readdir(count int) ([]fs.FileInfo, error) {
 		if ent.Mode.IsDir() {
 			fis[i] = dirFileInfo{}
 		} else {
-			fis[i] = regFileWithSize{name: ent.Name, size: ent.Size}
+			fis[i] = regFileInfo{name: ent.Name, size: ent.Size}
 		}
 	}
 	return fis, nil
 }
 
-type regFileWithSize struct {
+// Implement DeadPropsHolder so we can set a creation date, which macOS maybe
+// reportedly expects? It at least asks for it.
+var _ webdav.DeadPropsHolder = wdDir{}
+
+func (wdDir) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return staticDeadProps, nil
+}
+func (wdDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
+	return nil, webdav.ErrNotImplemented
+}
+
+type regFileInfo struct {
 	name string
 	size int64
 }
 
-func (r regFileWithSize) Name() string       { return r.name }
-func (r regFileWithSize) Size() int64        { return r.size }
-func (r regFileWithSize) Mode() os.FileMode  { return 0444 }
-func (r regFileWithSize) ModTime() time.Time { return time.Time{} }
-func (r regFileWithSize) IsDir() bool        { return false }
-func (r regFileWithSize) Sys() any           { return nil }
+func (r regFileInfo) Name() string       { return r.name }
+func (r regFileInfo) Size() int64        { return r.size }
+func (r regFileInfo) Mode() os.FileMode  { return 0444 }
+func (r regFileInfo) ModTime() time.Time { return fakeStaticFileTime }
+func (r regFileInfo) IsDir() bool        { return false }
+func (r regFileInfo) Sys() any           { return nil }
 
 type dirFileInfo struct{}
 
 func (dirFileInfo) Name() string       { return "/" }
 func (dirFileInfo) Size() int64        { return 0 }
 func (dirFileInfo) Mode() os.FileMode  { return os.ModeDir | 0555 }
-func (dirFileInfo) ModTime() time.Time { return time.Time{} }
+func (dirFileInfo) ModTime() time.Time { return fakeStaticFileTime }
 func (dirFileInfo) IsDir() bool        { return true }
 func (dirFileInfo) Sys() any           { return nil }
 
@@ -372,4 +408,14 @@ func (ed *emptyDir) Close() error { return nil }
 
 func (ed *emptyDir) Readdir(count int) ([]fs.FileInfo, error) {
 	return nil, nil
+}
+
+var _ webdav.DeadPropsHolder = &emptyDir{}
+
+func (ed *emptyDir) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return staticDeadProps, nil
+}
+
+func (ed *emptyDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
+	return nil, webdav.ErrNotImplemented
 }

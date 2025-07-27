@@ -989,10 +989,14 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 		}, // our read‑only FS
 		LockSystem: webdav.NewMemLS(), // simple in‑memory locks
 	}
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "localhost:8793")
+	if err != nil {
+		ln, err = net.Listen("tcp", "localhost:0")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("gomodfs: failed to listen on port: %w", err)
 	}
+	log.Printf("gomodfs: webdav listening %s", ln.Addr().String())
 	hs := &http.Server{
 		Handler: h,
 	}

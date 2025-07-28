@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"reflect"
@@ -20,6 +21,43 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/net/webdav"
 )
+
+func (f *FS) newWebDAVHandler(debug bool) http.Handler {
+
+	wh := &webdav.Handler{
+		Prefix: "/",
+		FileSystem: webdavFS{
+			fs:      f,
+			verbose: debug,
+		},
+		LockSystem: webdav.NewMemLS(), // shouldn't be needed; but required to be non-nil
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if debug {
+			log.Printf("webdav %s %s", r.Method, r.URL.Path)
+		}
+		sp := f.Stats.StartSpan("webdav.ServeHTTP." + r.Method)
+		defer sp.End(nil) // TODO: track errors too
+
+		// If if the request is a conditional content request (GET or HEAD),
+		// just says it's always not modified because all our content is immutable.
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			if r.Header.Get("If-Modified-Since") != "" || r.Header.Get("If-None-Match") != "" {
+				f.Stats.StartSpan("webdav.NotModified").End(nil)
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			// For GET/HEAD requests (for file content, not for directory listings),
+			// set a long Expires header.
+			expires := time.Now().UTC().AddDate(0, 3, 0) // 3 months? sure.
+			w.Header().Set("Expires", expires.Format(http.TimeFormat))
+		}
+
+		wh.ServeHTTP(w, r)
+	})
+}
 
 type webdavFS struct {
 	fs      *FS

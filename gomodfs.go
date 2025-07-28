@@ -33,7 +33,6 @@ import (
 	"github.com/tailscale/gomodfs/store/gitstore"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
-	"golang.org/x/net/webdav"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -979,16 +978,11 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 	if runtime.GOOS != "darwin" {
 		return nil, fmt.Errorf("gomodfs: WebDAV mount is currently only supported on macOS")
 	}
+	if opt == nil {
+		opt = &MountOpts{}
+	}
 
 	// Configure the WebDAV handler.
-	h := &webdav.Handler{
-		Prefix: "/", // serve at the root
-		FileSystem: webdavFS{
-			fs:      f,
-			verbose: opt != nil && opt.Debug,
-		}, // our read‑only FS
-		LockSystem: webdav.NewMemLS(), // simple in‑memory locks
-	}
 	ln, err := net.Listen("tcp", "localhost:8793")
 	if err != nil {
 		ln, err = net.Listen("tcp", "localhost:0")
@@ -998,7 +992,7 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 	}
 	log.Printf("gomodfs: webdav listening %s", ln.Addr().String())
 	hs := &http.Server{
-		Handler: h,
+		Handler: f.newWebDAVHandler(opt.Debug),
 	}
 	go hs.Serve(ln)
 

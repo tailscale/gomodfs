@@ -22,6 +22,20 @@ import (
 	"github.com/tailscale/gomodfs/store"
 )
 
+func validTSGoOSARCH(goos, goarch string) bool {
+	switch goos {
+	case "linux", "darwin", "windows":
+	default:
+		return false
+	}
+	switch goarch {
+	case "amd64", "arm64":
+	default:
+		return false
+	}
+	return true
+}
+
 // tsGoRoot is Tailscale's ~/.cache/tsgo directory.
 // It pretends to the GOOS as given by the "goos" and "goarch" fields.
 //

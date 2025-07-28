@@ -279,6 +279,21 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 			return mh, nil
 		}
 
+		// Special case for the Tailscale Go toolchain.
+		if mv.Module == "github.com/tailscale/go" && strings.HasPrefix(mv.Version, "tsgo-") {
+			parts := strings.SplitN(mv.Version, "-", 4)
+			if len(parts) != 4 {
+				return nil, fmt.Errorf("invalid tsgo version %q", mv.Version)
+			}
+			goos, goarch, commitHash := parts[1], parts[2], parts[3]
+			_, root, err := fs.getTailscaleGoRoot(ctx, goos, goarch, commitHash)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get Tailscale Go root for %q: %w", mv.Version, err)
+			}
+			fs.setZipRootCache(mv, root)
+			return root, nil
+		}
+
 		root, err := fs.Store.GetZipRoot(ctx, mv)
 		if err == nil {
 			fs.setZipRootCache(mv, root)
@@ -412,14 +427,7 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 				log.Printf("Invalid tsgo name %q, expected tsgo-$GOOS-$GOARCH", name)
 				return nil, syscall.ENOENT
 			}
-			switch goos {
-			case "linux", "darwin", "windows":
-			default:
-				return nil, syscall.ENOENT
-			}
-			switch goarch {
-			case "amd64", "arm64":
-			default:
+			if !validTSGoOSARCH(goos, goarch) {
 				return nil, syscall.ENOENT
 			}
 			return n.NewInode(ctx, &tsgoRoot{
@@ -901,14 +909,20 @@ type statusFile struct {
 	fs *FS
 }
 
-func (n *statusFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+// statusJSON returns the JSON-encoded status
+// of the <root>/.gomodfs-status file.
+func (f *FS) statusJSON() []byte {
 	stj, _ := json.MarshalIndent(procStat{
 		Filesystem: "gomodfs",
 		Uptime:     time.Since(procStart).Seconds(),
-		Ops:        n.fs.Stats.Clone(),
+		Ops:        f.Stats.Clone(),
 	}, "", "  ")
 	stj = append(stj, '\n')
-	return &statusFH{json: stj}, fuse.FOPEN_DIRECT_IO, 0
+	return stj
+}
+
+func (n *statusFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	return &statusFH{json: n.fs.statusJSON()}, fuse.FOPEN_DIRECT_IO, 0
 }
 
 type statusFH struct {
@@ -1000,6 +1014,7 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 	go hs.Serve(ln)
 
 	out, err := exec.Command("/sbin/mount_webdav",
+		"-S", // unmount without GUI popups on any problems
 		"-v", "gomodfs",
 		"http://localhost:"+strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
 		mntPoint).CombinedOutput()

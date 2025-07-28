@@ -5,6 +5,7 @@ package gomodfs
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -26,7 +27,6 @@ import (
 )
 
 func (f *FS) newWebDAVHandler(debug bool) http.Handler {
-
 	wh := &webdav.Handler{
 		Prefix: "/",
 		FileSystem: webdavFS{
@@ -138,6 +138,9 @@ func parseWDPath(name string) (ret wdPath) {
 		ret.NotExist = true
 		return
 	}
+	if strings.HasPrefix(name, "tsgo-") {
+		return parseWDTSGoPath(name)
+	}
 	if dlSuffix, ok := strings.CutPrefix(name, "cache/download/"); ok {
 		escMod, escVer, ok := strings.Cut(dlSuffix, "/@v/")
 		if !ok {
@@ -183,6 +186,42 @@ func parseWDPath(name string) (ret wdPath) {
 	return
 }
 
+func parseWDTSGoPath(name string) (ret wdPath) {
+	name, ok := strings.CutPrefix(name, "tsgo-")
+	if !ok {
+		return
+	}
+	osHyphenArch, rest, ok := strings.Cut(name, "/")
+	if !ok {
+		return
+	}
+	goos, goarch, ok := strings.Cut(osHyphenArch, "-")
+	if !ok {
+		return
+	}
+	if !validTSGoOSARCH(goos, goarch) {
+		ret.NotExist = true
+		return
+	}
+	firstSeg, rest, _ := strings.Cut(rest, "/")
+	m := tsgoRootLookupRx.FindStringSubmatch(firstSeg)
+	if m == nil {
+		ret.NotExist = true
+		return
+	}
+	hash, wantExtractedFile := m[1], m[2] != ""
+
+	ret.ModVersion.Module = "github.com/tailscale/go"
+	ret.ModVersion.Version = fmt.Sprintf("tsgo-%s-%s-%s", goos, goarch, hash)
+	if wantExtractedFile {
+		ret.WellKnown = "tsgo.extracted"
+		return
+	}
+	ret.Path = strings.TrimSuffix(rest, "/")
+	ret.InZip = true
+	return ret
+}
+
 func parseModVersion(escMod, escVer string) (mv store.ModuleVersion, ok bool) {
 	var err error
 	mv.Module, err = module.UnescapePath(escMod)
@@ -222,7 +261,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
-		sp := d.fs.Stats.StartSpan("webdav.Stat-ext-" + ext)
+		sp := d.fs.Stats.StartSpan("webdav.Stat-et-" + ext)
 		v, err := d.fs.getMetaFileByExt(ctx, dp.ModVersion, ext)
 		sp.End(err)
 		if err != nil {
@@ -243,23 +282,19 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 	if err != nil {
 		return nil, err
 	}
-	spGF := d.fs.Stats.StartSpan("webdav.Stat-GetFile")
-	contents, err := d.fs.Store.GetFile(ctx, mh, dp.Path)
+	spSS := d.fs.Stats.StartSpan("webdav.Stat.Store.Stat")
+	fi, err = d.fs.Store.Stat(ctx, mh, dp.Path)
 	if err != nil {
-		if errors.Is(err, store.ErrIsDir) {
-			spGF.End(nil)
-			return dirFileInfo{baseName: base}, nil
-		}
 		if errors.Is(err, os.ErrNotExist) {
-			spGF.End(nil)
+			spSS.End(nil)
 			return nil, os.ErrNotExist
 		}
 		log.Printf("Failed to get file %q in zip for %v: %v", dp.Path, dp.ModVersion, err)
-		spGF.End(err)
+		spSS.End(err)
 		return nil, err
 	}
-	spGF.End(nil)
-	return regFileInfo{name: name, size: int64(len(contents))}, nil
+	spSS.End(nil)
+	return fi, nil
 }
 
 func newWDFileFromContents(name string, contents []byte) webdav.File {
@@ -275,7 +310,14 @@ func newWDFileFromContents(name string, contents []byte) webdav.File {
 func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (retFile webdav.File, retErr error) {
 	base := path.Base(name)
 	sp := d.fs.Stats.StartSpan("webdav.OpenFile")
-	defer func() { sp.End(retErr) }()
+	spOK := false
+	defer func() {
+		if spOK {
+			sp.End(nil)
+		} else {
+			sp.End(retErr)
+		}
+	}()
 
 	if d.verbose {
 		defer func() {
@@ -285,6 +327,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 
 	// Reject if any write flag is set.
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0 {
+		spOK = true // don't treat span as an error
 		return nil, os.ErrPermission
 	}
 	dp := parseWDPath(name)
@@ -293,8 +336,11 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 		return nil, os.ErrNotExist
 	}
 	if dp.WellKnown != "" {
-		if dp.WellKnown == ".gomodfs-status" {
-			panic("TODO: implement .gomodfs-status")
+		switch dp.WellKnown {
+		case ".gomodfs-status":
+			return newWDFileFromContents(base, d.fs.statusJSON()), nil
+		case "tsgo.extracted":
+			return newWDFileFromContents(base, nil), nil
 		}
 		return nil, os.ErrNotExist
 	}
@@ -361,7 +407,7 @@ func (wdRegularFile) Write([]byte) (int, error) {
 var creationDateProp = xml.Name{Space: "DAV:", Local: "creationdate"}
 
 var (
-	fakeStaticFileTime = time.Date(2009, 11, 12, 13, 14, 15, 0, time.UTC)
+	fakeStaticFileTime = store.FakeStaticFileTime
 )
 
 var staticDeadProps = map[xml.Name]webdav.Property{
@@ -407,7 +453,7 @@ func (wd wdDir) Readdir(count int) ([]fs.FileInfo, error) {
 		if ent.Mode.IsDir() {
 			fis[i] = dirFileInfo{baseName: ent.Name}
 		} else {
-			fis[i] = regFileInfo{name: ent.Name, size: ent.Size}
+			fis[i] = regFileInfo{name: ent.Name, size: ent.Size, mode: ent.Mode}
 		}
 	}
 	return fis, nil
@@ -427,11 +473,12 @@ func (wdDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 type regFileInfo struct {
 	name string
 	size int64
+	mode os.FileMode
 }
 
 func (r regFileInfo) Name() string       { return r.name }
 func (r regFileInfo) Size() int64        { return r.size }
-func (r regFileInfo) Mode() os.FileMode  { return 0444 }
+func (r regFileInfo) Mode() os.FileMode  { return cmp.Or(r.mode, 0444) }
 func (r regFileInfo) ModTime() time.Time { return fakeStaticFileTime }
 func (r regFileInfo) IsDir() bool        { return false }
 func (r regFileInfo) Sys() any           { return nil }

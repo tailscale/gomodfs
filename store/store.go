@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
+	"io/fs"
+	"time"
 )
 
 var ErrCacheMiss = errors.New("cache miss")
@@ -32,6 +33,15 @@ type Store interface {
 	// The path is  "foo.txt" or "foo/bar.txt or "" for the root directory.
 	GetFile(ctx context.Context, h ModHandle, path string) ([]byte, error)
 
+	// Stat returns the os.FileInfo for a file within the zip file.
+	//
+	// The FileInfo's Mode is the mode bits (e.g. 0444, 0644, 0755) and optionally
+	// also [os.ModeDir] for directories.
+	//
+	// If the file does not exist, it should return error [os.ErrNotExist].
+	// Other errors are effectively I/O errors.
+	Stat(ctx context.Context, h ModHandle, path string) (fs.FileInfo, error)
+
 	// path is "" for root, else "foo" or "foo/bar" (no trailing slash)
 	Readdir(ctx context.Context, h ModHandle, path string) ([]Dirent, error)
 
@@ -55,14 +65,14 @@ type PutFile interface {
 	// relative to the root of the zip file.
 	// For example "main.go" or "foo/bar/baz_test.go".
 	Path() string
-	Mode() os.FileMode // only 0644 or 0755 are valid
+	Mode() fs.FileMode // only 0644 or 0755 are valid
 	Size() int64       // size of the file in bytes
 	Open() (io.ReadCloser, error)
 }
 
 type Dirent struct {
 	Name string      // bare name, no slashes
-	Mode os.FileMode // can be 0644 or 0 (regular files), 0755 (executable files), or fs.ModeDir; no symlinks
+	Mode fs.FileMode // can be 0644 or 0 (regular files), 0755 (executable files), or fs.ModeDir; no symlinks
 	Size int64       // for regular files
 }
 
@@ -72,3 +82,7 @@ type ModuleVersion struct {
 }
 
 type ModHandle interface{}
+
+// FakeStaticFileTime is a fake modtime and creation time
+// used for immutable static files in the gomodfs filesystem.
+var FakeStaticFileTime = time.Date(2009, 11, 12, 13, 14, 15, 0, time.UTC)

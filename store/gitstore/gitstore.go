@@ -78,8 +78,14 @@ type objResponse struct {
 	obj object // valid only if err == nil
 }
 
+// anyType is a sentinel value for getObject to indicate that any type is acceptable
+// and the caller will check it.
+const anyType = "_anytype_"
+
 // getObject looks up the git object with the given rev (a hash or ref or
 // rev-parse expression).
+//
+// If wantType is [anyType], it doesn't validate the type of the object.
 //
 // err is errMissing if the object is not found.
 func (d *Storage) getObject(ctx context.Context, rev, wantType string) (object, error) {
@@ -93,7 +99,7 @@ func (d *Storage) getObject(ctx context.Context, rev, wantType string) (object, 
 	case <-ctx.Done():
 		return object{}, ctx.Err()
 	case res := <-req.res:
-		if res.err == nil && res.obj.typ != wantType {
+		if res.err == nil && (wantType != anyType && res.obj.typ != wantType) {
 			return object{}, fmt.Errorf("expected %q (%v) to be a %q, got %q", rev, res.obj.hash, wantType, res.obj.typ)
 		}
 		return res.obj, res.err
@@ -625,12 +631,12 @@ func infoRefName(h store.ModuleVersion) (string, error) {
 type modHandle struct {
 	modTree objRef
 
-	// blobRef optionally contains the blob refs for file
+	// blobMeta optionally contains the blob refs for file
 	// with the tree. (e.g. "store/gitstore/gitstore.go" => blob)
 	// If nil, the caller should fall back to getting the data
 	// otherwise.
 	// It is used for preloading data that'll probably be needed.
-	blobRef map[string]blobMeta
+	blobMeta map[string]blobMeta
 
 	dirEnts map[string][]store.Dirent // path to dirEnt
 }
@@ -649,14 +655,61 @@ func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) (
 		return nil, store.ErrIsDir
 	}
 
-	obj, err := s.getObject(ctx, fmt.Sprintf("%s:zip/%s", mh.modTree, path), "blob")
+	obj, err := s.getObject(ctx, fmt.Sprintf("%s:zip/%s", mh.modTree, path), anyType)
 	if err != nil {
 		if errors.Is(err, errMissing) {
 			return nil, os.ErrNotExist
 		}
 		return nil, err
 	}
+	if obj.typ == "tree" {
+		return nil, store.ErrIsDir
+	}
+	if obj.typ != "blob" {
+		return nil, fmt.Errorf("expected %q in %v to be a blob, got %q", path, mh.modTree, obj.typ)
+	}
 	return obj.content, nil
+}
+
+// dirFileInfo is a fs.FileInfo for directories in the git store.
+type dirFileInfo struct {
+	baseName string
+}
+
+func (d dirFileInfo) Name() string       { return d.baseName }
+func (d dirFileInfo) Size() int64        { return 0 }
+func (d dirFileInfo) Mode() os.FileMode  { return fs.ModeDir | 0755 }
+func (d dirFileInfo) ModTime() time.Time { return store.FakeStaticFileTime }
+func (d dirFileInfo) IsDir() bool        { return true }
+func (d dirFileInfo) Sys() any           { return nil }
+
+// regFileInfo is a fs.FileInfo for regular files in the git store.
+type regFileInfo struct {
+	baseName string
+	mode     os.FileMode
+	size     int64
+}
+
+func (r regFileInfo) Name() string       { return r.baseName }
+func (r regFileInfo) Size() int64        { return r.size }
+func (r regFileInfo) Mode() os.FileMode  { return r.mode }
+func (r regFileInfo) ModTime() time.Time { return store.FakeStaticFileTime }
+func (r regFileInfo) IsDir() bool        { return false }
+func (r regFileInfo) Sys() any           { return nil }
+
+func (s *Storage) Stat(ctx context.Context, h store.ModHandle, modPath string) (fs.FileInfo, error) {
+	mh := h.(*modHandle)
+	if _, ok := mh.dirEnts[modPath]; ok {
+		return dirFileInfo{baseName: path.Base(modPath)}, nil
+	}
+	if meta, ok := mh.blobMeta[modPath]; ok {
+		return regFileInfo{
+			baseName: path.Base(modPath),
+			mode:     meta.Mode,
+			size:     meta.Size,
+		}, nil
+	}
+	return nil, os.ErrNotExist
 }
 
 func (s *Storage) GetInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
@@ -787,9 +840,9 @@ func (s *Storage) newModeHandle(mv store.ModuleVersion, modTree objRef) (store.M
 	var zero store.ModHandle
 
 	mh := &modHandle{
-		modTree: modTree,
-		blobRef: make(map[string]blobMeta),
-		dirEnts: make(map[string][]store.Dirent),
+		modTree:  modTree,
+		blobMeta: make(map[string]blobMeta),
+		dirEnts:  make(map[string][]store.Dirent),
 	}
 
 	out, err := s.git("ls-tree", "-t", "-r", "--format=%(objectname) %(objectmode) %(objectsize) %(path)", modTree.String()+":zip").CombinedOutput()
@@ -841,7 +894,7 @@ func (s *Storage) newModeHandle(mv store.ModuleVersion, modTree objRef) (store.M
 		pathFromRoot := string(rest)
 
 		if !mode.IsDir() {
-			mh.blobRef[pathFromRoot] = blobMeta{
+			mh.blobMeta[pathFromRoot] = blobMeta{
 				Blob: ref,
 				Size: size,
 				Mode: mode,

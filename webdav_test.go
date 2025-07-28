@@ -91,6 +91,49 @@ func TestParseWDPath(t *testing.T) {
 				Path:       "build", // without trailing slash
 			},
 		},
+		{
+			path: "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09.extracted",
+			want: wdPath{
+				ModVersion: store.ModuleVersion{
+					Module:  "github.com/tailscale/go",
+					Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
+				},
+				WellKnown: "tsgo.extracted",
+			},
+		},
+		{
+			path: "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/all.bash",
+			want: wdPath{
+				ModVersion: store.ModuleVersion{
+					Module:  "github.com/tailscale/go",
+					Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
+				},
+				InZip: true,
+				Path:  "all.bash",
+			},
+		},
+		{
+			path: "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/bin/", // with trailing slash
+			want: wdPath{
+				ModVersion: store.ModuleVersion{
+					Module:  "github.com/tailscale/go",
+					Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
+				},
+				InZip: true,
+				Path:  "bin", // without trailing slash
+			},
+		},
+		{
+			path: "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/bin/go",
+			want: wdPath{
+				ModVersion: store.ModuleVersion{
+					Module:  "github.com/tailscale/go",
+					Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
+				},
+				InZip: true,
+				Path:  "bin/go",
+			},
+		},
 	}
 
 	for _, tt := range tests {

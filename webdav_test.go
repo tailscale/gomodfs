@@ -134,6 +134,10 @@ func TestParseWDPath(t *testing.T) {
 				Path:  "bin/go",
 			},
 		},
+		{
+			path: "tsgo-darwin-arm64",
+			want: wdPath{},
+		},
 	}
 
 	for _, tt := range tests {

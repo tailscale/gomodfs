@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 // The dumppack command is used to dump the contents of a pack file
 // to a specified path for debugging purposes.
 package main

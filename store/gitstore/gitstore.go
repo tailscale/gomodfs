@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package gitstore stores gomodfs modules in a git repository.
 //
 // git's storage backend has the nice property that it does de-duping even if

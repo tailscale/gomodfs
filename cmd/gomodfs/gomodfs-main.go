@@ -1,3 +1,9 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
+// The gomodfs server is a virtual file system (FUSE or WebDAV) that implements
+// a read-only GOMODCACHE filesystem that pretends that all modules are accessible,
+// downloading them on demand as needed.
 package main
 
 import (

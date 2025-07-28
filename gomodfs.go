@@ -563,6 +563,7 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 		path = n.path + "/" + name
 	}
 	out.Size = uint64(ent.Size)
+	out.Mode = fuseMode(ent.Mode)
 	return n.NewInode(ctx, &pathUnderZipRoot{
 		fs:   n.fs,
 		mv:   n.mv,

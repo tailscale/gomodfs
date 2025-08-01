@@ -18,12 +18,15 @@ import (
 	"github.com/tailscale/gomodfs"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
+	"github.com/willscott/go-nfs"
 )
 
 var (
-	debugListen = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
-	verbose     = flag.Bool("verbose", false, "enable verbose logging")
-	useWebDAV   = flag.Bool("webdav", false, "use WebDAV instead of FUSE (useful on macOS w/o kernel extensions allowed)")
+	debugListen    = flag.String("http-debug", "", "if set, listen on this address for a debug HTTP server")
+	verbose        = flag.Bool("verbose", false, "enable verbose logging")
+	useWebDAV      = flag.Bool("webdav", false, "use WebDAV instead of FUSE (useful on macOS w/o kernel extensions allowed)")
+	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
+	flagMountPoint = flag.String("mount", filepath.Join(os.Getenv("HOME"), "mnt-gomodfs"), "if set, mount the filesystem at this path")
 )
 
 // This demonstrates how to build a file system in memory. The
@@ -39,14 +42,15 @@ func main() {
 	cmd.Dir = gitCache
 	cmd.Run() // best effort
 
-	mntDir := filepath.Join(os.Getenv("HOME"), "mnt-gomodfs")
-	exec.Command("umount", mntDir).Run() // best effort
-	if os.Getenv("GOOS") == "darwin" {
-		exec.Command("diskutil", "unmount", "force", mntDir).Run() // best effort
-	}
-
-	if err := os.MkdirAll(mntDir, 0755); err != nil {
-		log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
+	mntDir := *flagMountPoint
+	if mntDir != "" {
+		exec.Command("umount", mntDir).Run() // best effort
+		if os.Getenv("GOOS") == "darwin" {
+			exec.Command("diskutil", "unmount", "force", mntDir).Run() // best effort
+		}
+		if err := os.MkdirAll(mntDir, 0755); err != nil {
+			log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
+		}
 	}
 
 	st := &stats.Stats{}
@@ -70,6 +74,20 @@ func main() {
 			Handler: mfs,
 		}
 		go hs.Serve(ln)
+	}
+
+	if *flagNFS != "" {
+		ln, err := net.Listen("tcp", *flagNFS)
+		if err != nil {
+			log.Fatalf("Failed to listen on NFS port %s: %v", *flagNFS, err)
+		}
+		log.Printf("NFS server listening at %s", ln.Addr())
+		go nfs.Serve(ln, mfs.NFSHandler())
+	}
+
+	if mntDir == "" {
+		log.Printf("Not mounting filesystem, use --mount flag to specify mount point")
+		select {}
 	}
 
 	var err error

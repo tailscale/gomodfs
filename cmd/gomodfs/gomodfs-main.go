@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	"github.com/tailscale/gomodfs"
 	"github.com/tailscale/gomodfs/stats"
@@ -82,6 +83,10 @@ func main() {
 			log.Fatalf("Failed to listen on NFS port %s: %v", *flagNFS, err)
 		}
 		log.Printf("NFS server listening at %s", ln.Addr())
+		if runtime.GOOS == "darwin" {
+			port := ln.Addr().(*net.TCPAddr).Port
+			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
+		}
 		go nfs.Serve(ln, mfs.NFSHandler())
 	}
 

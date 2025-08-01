@@ -90,7 +90,7 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 	f := FileAttribute{}
 
 	m := info.Mode()
-	f.FileMode = uint32(m)
+	f.FileMode = uint32(m.Perm())
 	if info.IsDir() {
 		f.Type = FileTypeDirectory
 	} else if m&os.ModeSymlink != 0 {

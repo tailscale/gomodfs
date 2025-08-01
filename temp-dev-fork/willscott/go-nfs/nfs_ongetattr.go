@@ -28,6 +28,7 @@ func onGetAttr(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 	attr := ToFileAttribute(info, fullPath)
+	Log.Debugf("onGetAttr: %s, attr: %+v", fullPath, attr)
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {

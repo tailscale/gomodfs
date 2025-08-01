@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/willscott/go-nfs"
+	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
 )
 
 func (fs *FS) NFSHandler() nfs.Handler {
@@ -32,9 +32,16 @@ type billyFS struct {
 	fs *FS
 }
 
-var _ billy.Filesystem = billyFS{}
+var (
+	_ billy.Filesystem = billyFS{}
+	_ billy.Capable    = billyFS{}
+)
 
 var errReadonly = errors.New("gomodfs is read-only")
+
+func (billyFS) Capabilities() billy.Capability {
+	return billy.ReadCapability | billy.SeekCapability
+}
 
 func (b billyFS) Join(elem ...string) string { return path.Join(elem...) }
 
@@ -110,6 +117,14 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	if strings.HasPrefix(filename, ".") {
 		return nil, os.ErrNotExist
 	}
+	if filename == "hello-gomodfs.txt" {
+		return regFileInfo{
+			name: "hello-gomodfs.txt",
+			size: 123,
+			mode: 0444,
+		}, nil
+	}
+	log.Printf("TODO: NFS Lstat(%q) = NotExist for now", filename)
 
 	return nil, os.ErrNotExist // TODO
 
@@ -126,7 +141,7 @@ func (b billyFS) Readlink(link string) (string, error) {
 
 func (h *NFSHandler) Mount(ctx context.Context, c net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
 	log.Printf("NFS mount request from %s for %+v, %q", c.RemoteAddr(), req.Header, req.Dirpath)
-	return nfs.MountStatusOk, billyFS{fs: h.fs}, nil
+	return nfs.MountStatusOk, billyFS{fs: h.fs}, []nfs.AuthFlavor{nfs.AuthFlavorNull}
 }
 
 func (h *NFSHandler) Change(billy.Filesystem) billy.Change {
@@ -143,15 +158,22 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	if len(path) == 0 {
 		return []byte("root")
 	}
+	if len(path) == 1 && path[0] == "hello-gomodfs.txt" {
+		return []byte("hello-test")
+	}
 	return nil
+
 }
 
 func (h *NFSHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
+	log.Printf("NFS FromHandle called with fh=%q", fh)
 	if string(fh) == "root" {
-		log.Printf("NFS FromHandle called with root handle")
 		return billyFS{fs: h.fs}, nil, nil
 	}
-	log.Printf("NFS FromHandle called with fh=%q", fh)
+	if string(fh) == "hello-test" {
+		return billyFS{fs: h.fs}, []string{"hello-gomodfs.txt"}, nil
+	}
+	log.Printf("TODO: NFS FromHandle called with fh=%q", fh)
 	return nil, nil, errors.New("TODO: implement FromHandle")
 }
 

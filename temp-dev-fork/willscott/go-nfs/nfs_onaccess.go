@@ -27,19 +27,29 @@ func onAccess(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, path)); err != nil {
+	attr := tryStat(fs, path)
+	if err := WritePostOpAttrs(writer, attr); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
+	oldMask := mask
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		mask = mask & (1 | 2 | 0x20)
 	}
+	mask2 := mask
+	mask2 |= 1 // can read
+	mask2 |= 2 // can lookup
+	if attr.Type == FileTypeDirectory {
+		mask2 |= 0x20 // can search
+	}
 
-	if err := xdr.Write(writer, mask); err != nil {
+	if err := xdr.Write(writer, mask2); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	if err := w.Write(writer.Bytes()); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
+
+	Log.Debugf("onAccess: %s, mask: %d -> %d -> %d, attr: %+v", fs.Join(path...), oldMask, mask, mask2, attr)
 	return nil
 }

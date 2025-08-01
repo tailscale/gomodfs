@@ -19,7 +19,7 @@ import (
 	"github.com/tailscale/gomodfs"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
-	"github.com/willscott/go-nfs"
+	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
 )
 
 var (
@@ -78,6 +78,9 @@ func main() {
 	}
 
 	if *flagNFS != "" {
+		if *verbose {
+			nfs.Log.SetLevel(nfs.TraceLevel)
+		}
 		ln, err := net.Listen("tcp", *flagNFS)
 		if err != nil {
 			log.Fatalf("Failed to listen on NFS port %s: %v", *flagNFS, err)

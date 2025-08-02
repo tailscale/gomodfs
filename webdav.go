@@ -71,9 +71,9 @@ func (d webdavFS) Mkdir(_ context.Context, _ string, _ os.FileMode) error { retu
 func (d webdavFS) RemoveAll(_ context.Context, _ string) error            { return os.ErrPermission }
 func (d webdavFS) Rename(_ context.Context, _, _ string) error            { return os.ErrPermission }
 
-// wdPath is the gomodfs-specific path structure
+// gmPath is the gomodfs-specific path structure
 // for paths received from WebDAV Stat or OpenFile calls.
-type wdPath struct {
+type gmPath struct {
 	// WellKnown, if non-empty, indicates that the path is
 	// for a well-known gomodfs path. The only possible value
 	// so far is ".gomodfs-status", for the status file.
@@ -107,7 +107,7 @@ type wdPath struct {
 }
 
 // String returns a debug representation of the wdPath for tests.
-func (p wdPath) String() string {
+func (p gmPath) String() string {
 	var sb strings.Builder
 	sb.WriteByte('{')
 	rv := reflect.ValueOf(p)
@@ -125,9 +125,9 @@ func (p wdPath) String() string {
 	return sb.String()
 }
 
-// parseWDPath parses a path as received for a WebDAV Stat or OpenFile call
+// parsePath parses a path as received for a WebDAV Stat or OpenFile call
 // and returns its godmodfs-specific structure.
-func parseWDPath(name string) (ret wdPath) {
+func parsePath(name string) (ret gmPath) {
 	if name == ".gomodfs-status" {
 		ret.WellKnown = ".gomodfs-status"
 		return
@@ -139,7 +139,7 @@ func parseWDPath(name string) (ret wdPath) {
 		return
 	}
 	if strings.HasPrefix(name, "tsgo-") {
-		return parseWDTSGoPath(name)
+		return parseTSGoPath(name)
 	}
 	if dlSuffix, ok := strings.CutPrefix(name, "cache/download/"); ok {
 		escMod, escVer, ok := strings.Cut(dlSuffix, "/@v/")
@@ -186,7 +186,7 @@ func parseWDPath(name string) (ret wdPath) {
 	return
 }
 
-func parseWDTSGoPath(name string) (ret wdPath) {
+func parseTSGoPath(name string) (ret gmPath) {
 	name, ok := strings.CutPrefix(name, "tsgo-")
 	if !ok {
 		return
@@ -252,7 +252,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		}()
 	}
 
-	dp := parseWDPath(name)
+	dp := parsePath(name)
 	if dp.NotExist {
 		d.fs.Stats.StartSpan("webdav.Stat.NotExist").End(nil)
 		return nil, os.ErrNotExist
@@ -330,7 +330,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 		spOK = true // don't treat span as an error
 		return nil, os.ErrPermission
 	}
-	dp := parseWDPath(name)
+	dp := parsePath(name)
 	if dp.NotExist {
 		d.fs.Stats.StartSpan("webdav.Stat.NotExist").End(nil)
 		return nil, os.ErrNotExist

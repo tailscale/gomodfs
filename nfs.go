@@ -59,21 +59,19 @@ func (b billyFS) Create(filename string) (billy.File, error) {
 const helloFileContents = "Hello, gomodfs!\n"
 
 type billyFile struct {
-	name string
 	*io.SectionReader
 }
 
-func (f billyFile) Name() string            { return f.name }
+func (f billyFile) Name() string            { panic("unused") } // only on create
 func (billyFile) Close() error              { return nil }
 func (billyFile) Lock() error               { return errReadonly }
 func (billyFile) Unlock() error             { return errReadonly }
 func (billyFile) Truncate(int64) error      { return errReadonly }
 func (billyFile) Write([]byte) (int, error) { return 0, errReadonly }
 
-func newBillyFileFromBytes(name string, data []byte, mode os.FileMode) billy.File {
+func newBillyFileFromBytes(data []byte) billy.File {
 	sr := io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
 	return billyFile{
-		name:          name,
 		SectionReader: sr,
 	}
 }
@@ -81,7 +79,7 @@ func newBillyFileFromBytes(name string, data []byte, mode os.FileMode) billy.Fil
 func (b billyFS) Open(filename string) (billy.File, error) {
 	log.Printf("gomodfs NFS Open called with %q", filename)
 	if filename == "hello-gomodfs.txt" {
-		return newBillyFileFromBytes(filename, []byte(helloFileContents), 0444), nil
+		return newBillyFileFromBytes([]byte(helloFileContents)), nil
 	}
 	return nil, fmt.Errorf("gomodfs TODO open %q", filename)
 }

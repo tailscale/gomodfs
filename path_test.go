@@ -9,7 +9,7 @@ import (
 	"github.com/tailscale/gomodfs/store"
 )
 
-func TestParseWDPath(t *testing.T) {
+func TestParsePath(t *testing.T) {
 	tests := []struct {
 		path string
 		want gmPath

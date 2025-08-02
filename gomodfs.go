@@ -16,6 +16,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1027,6 +1028,38 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 	mt := &webdavMount{ln: ln, path: mntPoint}
 	mt.ctx, mt.cancel = context.WithCancel(context.Background())
 	return mt, nil
+}
+
+func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr, opt *MountOpts) error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("gomodfs: NFS mount is currently only supported on macOS")
+	}
+	if opt == nil {
+		opt = &MountOpts{}
+	}
+	port := nfsAddr.(*net.TCPAddr).Port
+	ip, ok := netip.AddrFromSlice(nfsAddr.(*net.TCPAddr).IP)
+	if !ok {
+		return fmt.Errorf("gomodfs: invalid NFS address %q", nfsAddr)
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() {
+		ip = netip.MustParseAddr("127.0.0.1")
+	}
+	cmd := exec.Command("/sbin/mount",
+		"-t", "nfs",
+		"-r", // read-only
+		"-o", fmt.Sprintf("port=%d,mountport=%d", port, port),
+		"-o", "vers=3",
+		"-o", "tcp",
+		"-o", "nolock",
+		fmt.Sprintf("%s:/", ip),
+		mntDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gomodfs: failed to run mount command: %w; output: %s", err, out)
+	}
+	return nil
 }
 
 type webdavMount struct {

@@ -77,6 +77,7 @@ func main() {
 		go hs.Serve(ln)
 	}
 
+	var nfsListenAddr net.Addr
 	if *flagNFS != "" {
 		if *verbose {
 			nfs.Log.SetLevel(nfs.TraceLevel)
@@ -85,8 +86,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to listen on NFS port %s: %v", *flagNFS, err)
 		}
-		log.Printf("NFS server listening at %s", ln.Addr())
-		if runtime.GOOS == "darwin" {
+		nfsListenAddr = ln.Addr()
+		log.Printf("NFS server listening at %s", nfsListenAddr)
+		if runtime.GOOS == "darwin" && mntDir == "" {
 			port := ln.Addr().(*net.TCPAddr).Port
 			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
@@ -104,6 +106,10 @@ func main() {
 		mount, err = mfs.MountWebDAV(mntDir, &gomodfs.MountOpts{
 			Debug: *verbose,
 		})
+	} else if *flagNFS != "" {
+		err = mfs.MountNFS(mntDir, nfsListenAddr, &gomodfs.MountOpts{
+			Debug: *verbose,
+		})
 	} else {
 		mount, err = mfs.MountFUSE(mntDir, &gomodfs.MountOpts{
 			Debug: *verbose,
@@ -116,5 +122,9 @@ func main() {
 	log.Printf("Mounted on %s", mntDir)
 	log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
 
-	mount.Wait()
+	if mount != nil {
+		mount.Wait()
+	} else {
+		select {}
+	}
 }

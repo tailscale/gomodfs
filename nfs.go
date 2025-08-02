@@ -1,9 +1,11 @@
 package gomodfs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -53,10 +55,37 @@ func (b billyFS) Create(filename string) (billy.File, error) {
 	return nil, errReadonly
 
 }
-func (b billyFS) Open(filename string) (billy.File, error) {
-	panic(fmt.Sprintf("TODO billy Open(%q)", filename))
 
+const helloFileContents = "Hello, gomodfs!\n"
+
+type billyFile struct {
+	name string
+	*io.SectionReader
 }
+
+func (f billyFile) Name() string            { return f.name }
+func (billyFile) Close() error              { return nil }
+func (billyFile) Lock() error               { return errReadonly }
+func (billyFile) Unlock() error             { return errReadonly }
+func (billyFile) Truncate(int64) error      { return errReadonly }
+func (billyFile) Write([]byte) (int, error) { return 0, errReadonly }
+
+func newBillyFileFromBytes(name string, data []byte, mode os.FileMode) billy.File {
+	sr := io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
+	return billyFile{
+		name:          name,
+		SectionReader: sr,
+	}
+}
+
+func (b billyFS) Open(filename string) (billy.File, error) {
+	log.Printf("gomodfs NFS Open called with %q", filename)
+	if filename == "hello-gomodfs.txt" {
+		return newBillyFileFromBytes(filename, []byte(helloFileContents), 0444), nil
+	}
+	return nil, fmt.Errorf("gomodfs TODO open %q", filename)
+}
+
 func (b billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	if flag != 0 {
 		log.Printf("gomodfs NFS OpenFile called with flag %d, but gomodfs is read-only", flag)
@@ -98,7 +127,7 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	ret := []os.FileInfo{
 		regFileInfo{
 			name: "hello-gomodfs.txt",
-			size: 123,
+			size: int64(len(helloFileContents)),
 			mode: 0444,
 		},
 	}
@@ -120,7 +149,7 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	if filename == "hello-gomodfs.txt" {
 		return regFileInfo{
 			name: "hello-gomodfs.txt",
-			size: 123,
+			size: int64(len(helloFileContents)),
 			mode: 0444,
 		}, nil
 	}

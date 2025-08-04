@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -81,10 +82,10 @@ type billyFile struct {
 
 func (f billyFile) Name() string            { panic("unused") } // only on create
 func (billyFile) Close() error              { return nil }
-func (billyFile) Lock() error               { return errReadonly }
-func (billyFile) Unlock() error             { return errReadonly }
 func (billyFile) Truncate(int64) error      { return errReadonly }
 func (billyFile) Write([]byte) (int, error) { return 0, errReadonly }
+func (billyFile) Lock() error               { return errReadonly }
+func (billyFile) Unlock() error             { return errReadonly }
 
 func newBillyFileFromBytes(data []byte) billy.File {
 	sr := io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
@@ -189,7 +190,39 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 			dirFileInfo{baseName: "download"},
 		}, nil
 	}
-	return nil, nil
+
+	mp := parsePath(path)
+	if mp.NotExist {
+		return nil, os.ErrNotExist
+	}
+	if !mp.InZip {
+		return nil, nil
+	}
+
+	ctx := context.TODO()
+	mh, err := b.fs.getZipRoot(ctx, mp.ModVersion)
+	if err != nil {
+		return nil, err
+	}
+	spanRD := b.fs.Stats.StartSpan("nfs.Readdir")
+	ents, err := b.fs.Store.Readdir(ctx, mh, mp.Path)
+	spanRD.End(err)
+
+	ret := make([]os.FileInfo, len(ents))
+	for i, ent := range ents {
+		if ent.Mode.IsDir() {
+			ret[i] = dirFileInfo{baseName: ent.Name}
+			continue
+		}
+		ret[i] = regFileInfo{
+			name: ent.Name,
+			size: ent.Size,
+			mode: ent.Mode.Perm(),
+		}
+		// TODO: symlinks? but go modules and tsgo don't use them?
+	}
+
+	return ret, nil
 }
 
 func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
@@ -201,9 +234,10 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	case "":
 		// Nothing
 	case statusFile:
+		j := b.fs.statusJSON()
 		return regFileInfo{
 			name:       statusFile,
-			size:       100,
+			size:       int64(len(j)),
 			mode:       0444,
 			modTimeNow: true,
 		}, nil
@@ -212,9 +246,15 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 		return nil, errors.New("TODO")
 	}
 
-	if mp.CacheDownloadFileExt != "" {
-		log.Printf("NFS: TODO cache-download %v %v", mp.ModVersion, mp.CacheDownloadFileExt)
-		return nil, errors.New("TODO")
+	ctx := context.TODO()
+
+	if ext := mp.CacheDownloadFileExt; ext != "" {
+		v, err := b.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
+		if err != nil {
+			log.Printf("Failed to get %s file for %v: %v", ext, mp.ModVersion, err)
+			return nil, syscall.EIO
+		}
+		return regFileInfo{name: filepath.Base(filename), size: int64(len(v))}, nil
 	}
 
 	if !mp.InZip {
@@ -222,7 +262,6 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 		return dirFileInfo{}, nil
 	}
 
-	ctx := context.Background()
 	mh, err := b.fs.getZipRoot(ctx, mp.ModVersion)
 	if err != nil {
 		return nil, err
@@ -295,7 +334,6 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	}
 	handle := handle(ret)
 	if _, ok := h.handle[handle]; !ok {
-		log.Printf("ToHandle(%q) addded => %q", pathStr, ret)
 		h.handle[handle] = slices.Clone(path)
 	}
 	return ret

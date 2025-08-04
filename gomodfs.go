@@ -1055,7 +1055,8 @@ func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr, opt *MountOpts) error {
 		"-o", fmt.Sprintf("port=%d,mountport=%d", port, port),
 		"-o", "vers=3",
 		"-o", "tcp",
-		"-o", "nolock",
+		"-o", "locallocks", // required to pacify cmd/go file locking
+		"-o", "soft", // maybe avoid GUI popups during dev?
 		fmt.Sprintf("%s:/", ip),
 		mntDir,
 	)

@@ -285,7 +285,7 @@ func (wd wdDir) Readdir(count int) ([]fs.FileInfo, error) {
 		if ent.Mode.IsDir() {
 			fis[i] = dirFileInfo{baseName: ent.Name}
 		} else {
-			fis[i] = regFileInfo{name: ent.Name, size: ent.Size, mode: ent.Mode}
+			fis[i] = regFileInfo{name: ent.Name, size: ent.Size, mode: ent.Mode.Perm()}
 		}
 	}
 	return fis, nil
@@ -305,7 +305,7 @@ func (wdDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 type regFileInfo struct {
 	name       string
 	size       int64
-	mode       os.FileMode
+	mode       os.FileMode // 0644/0755. No type bits.
 	modTimeNow bool
 }
 

@@ -40,6 +40,10 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+const (
+	statusFile = ".gomodfs-status"
+)
+
 // FS is the gomodfs filesystem.
 type FS struct {
 	Git   *gitstore.Storage // legacy storage; TODO: remove this field, move all callers to Store interface
@@ -413,8 +417,8 @@ func (n *moduleNameNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 				Mode: fuse.S_IFDIR | 0755,
 			}), 0
 		}
-		if name == ".gomodfs-status" {
-			return n.NewInode(ctx, &statusFile{fs: n.fs},
+		if name == statusFile {
+			return n.NewInode(ctx, &statusFileNode{fs: n.fs},
 				fs.StableAttr{Mode: fuse.S_IFREG | 0644}), 0
 		}
 		// As a special case for Tailscale's needs unrelated to the GOMODCACHE
@@ -906,7 +910,7 @@ func (s *FS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Stats.ServeHTTP(w, r)
 }
 
-type statusFile struct {
+type statusFileNode struct {
 	fs.Inode
 	fs *FS
 }
@@ -923,7 +927,7 @@ func (f *FS) statusJSON() []byte {
 	return stj
 }
 
-func (n *statusFile) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (n *statusFileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	return &statusFH{json: n.fs.statusJSON()}, fuse.FOPEN_DIRECT_IO, 0
 }
 
@@ -931,7 +935,7 @@ type statusFH struct {
 	json []byte
 }
 
-func (f *statusFile) Read(_ context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (f *statusFileNode) Read(_ context.Context, h fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	fh, ok := h.(*statusFH)
 	if !ok {
 		log.Printf("statusFile.Getattr called with non-statusFH handle %T", h)
@@ -944,7 +948,7 @@ func (f *statusFile) Read(_ context.Context, h fs.FileHandle, dest []byte, off i
 	return fuse.ReadResultData(fh.json[off:end]), 0
 }
 
-func (f *statusFile) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (f *statusFileNode) Getattr(_ context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	fh, ok := h.(*statusFH)
 
 	out.AttrValid = 1

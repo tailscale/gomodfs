@@ -114,7 +114,7 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 	if err != nil {
 		return nil, err
 	}
-	spSS := d.fs.Stats.StartSpan("webdav.Stat.Store.Stat")
+	spSS := d.fs.Stats.StartSpan("webdav.Stat/Store.Stat")
 	fi, err = d.fs.Store.Stat(ctx, mh, dp.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -169,7 +169,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 	}
 	if dp.WellKnown != "" {
 		switch dp.WellKnown {
-		case ".gomodfs-status":
+		case statusFile:
 			return newWDFileFromContents(base, d.fs.statusJSON()), nil
 		case "tsgo.extracted":
 			return newWDFileFromContents(base, nil), nil
@@ -303,17 +303,23 @@ func (wdDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 }
 
 type regFileInfo struct {
-	name string
-	size int64
-	mode os.FileMode
+	name       string
+	size       int64
+	mode       os.FileMode
+	modTimeNow bool
 }
 
-func (r regFileInfo) Name() string       { return r.name }
-func (r regFileInfo) Size() int64        { return r.size }
-func (r regFileInfo) Mode() os.FileMode  { return cmp.Or(r.mode, 0444) }
-func (r regFileInfo) ModTime() time.Time { return fakeStaticFileTime }
-func (r regFileInfo) IsDir() bool        { return false }
-func (r regFileInfo) Sys() any           { return nil }
+func (r regFileInfo) Name() string      { return r.name }
+func (r regFileInfo) Size() int64       { return r.size }
+func (r regFileInfo) Mode() os.FileMode { return cmp.Or(r.mode, 0444) }
+func (r regFileInfo) ModTime() time.Time {
+	if r.modTimeNow {
+		return time.Now()
+	}
+	return fakeStaticFileTime
+}
+func (r regFileInfo) IsDir() bool { return false }
+func (r regFileInfo) Sys() any    { return nil }
 
 type dirFileInfo struct {
 	baseName string

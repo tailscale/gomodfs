@@ -15,8 +15,8 @@ func TestParsePath(t *testing.T) {
 		want gmPath
 	}{
 		{
-			path: ".gomodfs-status",
-			want: gmPath{WellKnown: ".gomodfs-status"},
+			path: statusFile,
+			want: gmPath{WellKnown: statusFile},
 		},
 		{
 			path: ".Spotlight-V100",

@@ -103,11 +103,13 @@ func (b billyFS) Open(filename string) (billy.File, error) {
 	switch mp.WellKnown {
 	case "":
 		// nothing
-	default:
-		return nil, fmt.Errorf("gomodfs TODO well known Open %q", filename)
+	case "tsgo.extracted":
+		return newBillyFileFromBytes(nil), nil // empty file
 	case statusFile:
 		j := b.fs.statusJSON()
 		return newBillyFileFromBytes(j), nil
+	default:
+		return nil, os.ErrNotExist
 	}
 
 	ctx := context.TODO()
@@ -241,9 +243,15 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 			mode:       0444,
 			modTimeNow: true,
 		}, nil
+	case "tsgo.extracted":
+		return regFileInfo{
+			name:       "tsgo.extracted",
+			size:       0, // empty file
+			mode:       0444,
+			modTimeNow: true,
+		}, nil
 	default:
-		log.Printf("NFS: TODO: well known Lstat(%q)", filename)
-		return nil, errors.New("TODO")
+		return nil, os.ErrNotExist
 	}
 
 	ctx := context.TODO()

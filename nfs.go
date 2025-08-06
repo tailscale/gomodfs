@@ -45,14 +45,46 @@ type handle [64]byte
 // zeroHandle is the root handle.
 var zeroHandle handle
 
+var statusHandle = handle{0: 'S', 1: 'T', 2: 'A', 3: 'T', 4: 'U', 5: 'S'}
+
 type NFSHandler struct {
 	fs *FS
 
 	nfs.Handler // temporary embedding during dev to watch what panics
 
-	mu        sync.Mutex
-	handle    map[handle][]string // => path segments
-	readCache map[handle]*readCacheEntry
+	mu          sync.Mutex
+	handle      map[handle][]string // => path segments
+	readCache   map[handle]*readCacheEntry
+	statusCache *statusMeta
+}
+
+// statusMeta is a snapshot of the [statusFile] contents:
+// both its FileInfo (notably its ModTime and Size) and its matching
+// JSON.
+type statusMeta struct {
+	fi   os.FileInfo // with ModTime set to when it was generated
+	json []byte
+}
+
+// statusFile generates or returns a recent snapshot of the status file.
+func (h *NFSHandler) statusFile() *statusMeta {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	const regenEvery = 2 * time.Second
+	if h.statusCache != nil && time.Since(h.statusCache.fi.ModTime()) < regenEvery {
+		return h.statusCache
+	}
+	j := h.fs.statusJSON()
+	h.statusCache = &statusMeta{
+		fi: regFileInfo{
+			name:    statusFile,
+			size:    int64(len(j)),
+			mode:    0444,
+			modTime: time.Now(),
+		},
+		json: j,
+	}
+	return h.statusCache
 }
 
 type readCacheEntry struct {
@@ -69,6 +101,7 @@ var (
 
 type billyFS struct {
 	fs *FS
+	h  *NFSHandler
 }
 
 var (
@@ -113,12 +146,9 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	log.Printf("NFS ReadDir(%q)", path)
 	switch path {
 	case "":
+		m := b.h.statusFile()
 		return []os.FileInfo{
-			regFileInfo{
-				name: statusFile,
-				size: 100,
-				mode: 0444,
-			},
+			m.fi,
 			dirFileInfo{baseName: "cache"},
 		}, nil
 	case "cache":
@@ -170,13 +200,8 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	case "":
 		// Nothing
 	case statusFile:
-		j := b.fs.statusJSON()
-		return regFileInfo{
-			name:       statusFile,
-			size:       int64(len(j)),
-			mode:       0444,
-			modTimeNow: true,
-		}, nil
+		m := b.h.statusFile()
+		return m.fi, nil
 	case "tsgo.extracted":
 		return regFileInfo{
 			name:       "tsgo.extracted",
@@ -230,7 +255,7 @@ func (b billyFS) Readlink(link string) (string, error) {
 
 func (h *NFSHandler) Mount(ctx context.Context, c net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
 	log.Printf("NFS mount request from %s for %+v, %q", c.RemoteAddr(), req.Header, req.Dirpath)
-	return nfs.MountStatusOk, billyFS{fs: h.fs}, []nfs.AuthFlavor{nfs.AuthFlavorNull}
+	return nfs.MountStatusOk, h.billyFS(), []nfs.AuthFlavor{nfs.AuthFlavorNull}
 }
 
 func (h *NFSHandler) Change(billy.Filesystem) billy.Change {
@@ -245,6 +270,9 @@ func (h *NFSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.
 func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	if len(path) == 0 {
 		return zeroHandle[:]
+	}
+	if len(path) == 1 && path[0] == statusFile {
+		return statusHandle[:]
 	}
 
 	pathStr := strings.Join(path, "/")
@@ -281,6 +309,10 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	return ret
 }
 
+func (h *NFSHandler) billyFS() billyFS {
+	return billyFS{fs: h.fs, h: h}
+}
+
 func (h *NFSHandler) FromHandle(handleb []byte) (billy.Filesystem, []string, error) {
 	if len(handleb) != 64 {
 		log.Printf("non-64-length handle %q", handleb)
@@ -289,7 +321,10 @@ func (h *NFSHandler) FromHandle(handleb []byte) (billy.Filesystem, []string, err
 	handle := handle(handleb)
 
 	if handle == zeroHandle {
-		return billyFS{fs: h.fs}, nil, nil
+		return h.billyFS(), nil, nil
+	}
+	if handle == statusHandle {
+		return h.billyFS(), []string{statusFile}, nil
 	}
 
 	h.mu.Lock()
@@ -300,7 +335,7 @@ func (h *NFSHandler) FromHandle(handleb []byte) (billy.Filesystem, []string, err
 		log.Printf("TODO: NFS FromHandle called with unknown handle %q", handle)
 		return nil, nil, errors.New("unknown handle")
 	}
-	return billyFS{fs: h.fs}, slices.Clone(pathSeg), nil
+	return h.billyFS(), slices.Clone(pathSeg), nil
 }
 
 func (h *NFSHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
@@ -350,6 +385,17 @@ func (n *NFSHandler) OnNFSRead(ctx context.Context, handleb []byte, offset uint6
 	return res, nil
 }
 
+func (n *NFSHandler) filenameLocked(h handle) (string, bool) {
+	if h == statusHandle {
+		return statusFile, true
+	}
+	pathSeg, ok := n.handle[h]
+	if !ok {
+		return "", false
+	}
+	return strings.Join(pathSeg, "/"), true
+}
+
 func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint64) ([]byte, *nfs.FileAttribute, error) {
 	n.mu.Lock()
 	ent, ok := n.readCache[h]
@@ -359,7 +405,7 @@ func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint
 		return ent.contents, ent.attr, nil
 	}
 
-	pathSeg, ok := n.handle[h]
+	filename, ok := n.filenameLocked(h)
 	n.mu.Unlock()
 	if !ok {
 		log.Printf("TODO: NFS FromHandle called with unknown handle %q", h)
@@ -369,45 +415,51 @@ func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint
 		}
 	}
 
-	filename := strings.Join(pathSeg, "/")
 	contents, attr, err := n.getFileContentsUncached(ctx, filename)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if uint64(len(contents)) <= readEnd {
+	if uint64(len(contents)) <= readEnd || filename == statusFile {
 		// The caller probably won't be coming back for more reads.
 		// No need to cache it.
 		return contents, attr, nil
 	}
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	ent = &readCacheEntry{
+	n.setReadCache(h, &readCacheEntry{
 		path:     filename,
 		contents: contents,
 		attr:     attr,
-		timer: time.AfterFunc(10*time.Second, func() {
-			n.removeFileCache(h)
-		}),
-	}
+	})
+	return contents, attr, err
+}
+
+func (n *NFSHandler) setReadCache(h handle, ent *readCacheEntry) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.readCache == nil {
 		n.readCache = map[handle]*readCacheEntry{}
 	}
+	ent.timer = time.AfterFunc(10*time.Second, func() {
+		n.removeFileCache(h)
+	})
 	n.readCache[h] = ent
-	return contents, attr, err
 }
 
 func (n *NFSHandler) removeFileCache(h handle) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	ent, ok := n.readCache[h]
+	_, ok := n.readCache[h]
 	if !ok {
 		return
 	}
-	log.Printf("NFS: dropping read cache entry for %q", ent.path)
 	delete(n.readCache, h)
+}
+
+func setNFSTime(attr *nfs.FileAttribute, t time.Time) {
+	attr.Atime = nfs.ToNFSTime(t)
+	attr.Mtime = attr.Atime
+	attr.Ctime = attr.Atime
 }
 
 func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename string) (data []byte, attr *nfs.FileAttribute, err error) {
@@ -416,12 +468,10 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 		FileMode: 0444, // unless overridden later
 		Nlink:    1,
 	}
+	setNFSTime(attr, store.FakeStaticFileTime)
 	hasher := fnv.New64()
 	_, _ = hasher.Write([]byte(filename))
 	attr.Fileid = hasher.Sum64()
-	attr.Atime = nfs.ToNFSTime(store.FakeStaticFileTime)
-	attr.Mtime = attr.Atime
-	attr.Ctime = attr.Atime
 
 	defer func() {
 		if err == nil {
@@ -440,8 +490,9 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 	case "tsgo.extracted":
 		return nil, attr, nil
 	case statusFile:
-		j := n.fs.statusJSON()
-		return j, attr, nil
+		m := n.statusFile()
+		setNFSTime(attr, m.fi.ModTime())
+		return m.json, attr, nil
 	default:
 		return nil, nil, os.ErrNotExist
 	}

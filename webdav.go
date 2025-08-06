@@ -306,6 +306,7 @@ type regFileInfo struct {
 	name       string
 	size       int64
 	mode       os.FileMode // 0644/0755. No type bits.
+	modTime    time.Time
 	modTimeNow bool
 }
 
@@ -315,6 +316,9 @@ func (r regFileInfo) Mode() os.FileMode { return cmp.Or(r.mode, 0444) }
 func (r regFileInfo) ModTime() time.Time {
 	if r.modTimeNow {
 		return time.Now()
+	}
+	if !r.modTime.IsZero() {
+		return r.modTime
 	}
 	return fakeStaticFileTime
 }

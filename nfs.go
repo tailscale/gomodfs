@@ -1,11 +1,11 @@
 package gomodfs
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/tailscale/gomodfs/store"
@@ -49,11 +50,22 @@ type NFSHandler struct {
 
 	nfs.Handler // temporary embedding during dev to watch what panics
 
-	mu     sync.Mutex
-	handle map[handle][]string // => path segments
+	mu        sync.Mutex
+	handle    map[handle][]string // => path segments
+	readCache map[handle]*readCacheEntry
 }
 
-var _ nfs.Handler = (*NFSHandler)(nil)
+type readCacheEntry struct {
+	contents []byte
+	path     string
+	attr     *nfs.FileAttribute
+	timer    *time.Timer // for the AfterFunc to remove it from the cache
+}
+
+var (
+	_ nfs.Handler     = (*NFSHandler)(nil)
+	_ nfs.ReadHandler = (*NFSHandler)(nil)
+)
 
 type billyFS struct {
 	fs *FS
@@ -72,87 +84,9 @@ func (billyFS) Capabilities() billy.Capability {
 
 func (b billyFS) Join(elem ...string) string { return path.Join(elem...) }
 
-// Create creates the named file with mode 0666 (before umask), truncating
-// it if it already exists. If successful, methods on the returned File can
-// be used for I/O; the associated file descriptor has mode O_RDWR.
-
-type billyFile struct {
-	*io.SectionReader
-}
-
-func (f billyFile) Name() string            { panic("unused") } // only on create
-func (billyFile) Close() error              { return nil }
-func (billyFile) Truncate(int64) error      { return errReadonly }
-func (billyFile) Write([]byte) (int, error) { return 0, errReadonly }
-func (billyFile) Lock() error               { return errReadonly }
-func (billyFile) Unlock() error             { return errReadonly }
-
-func newBillyFileFromBytes(data []byte) billy.File {
-	sr := io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
-	return billyFile{
-		SectionReader: sr,
-	}
-}
-
-func (b billyFS) Open(filename string) (billy.File, error) {
-	log.Printf("gomodfs NFS Open called with %q", filename)
-	mp := parsePath(filename)
-	if mp.NotExist {
-		return nil, os.ErrNotExist
-	}
-	switch mp.WellKnown {
-	case "":
-		// nothing
-	case "tsgo.extracted":
-		return newBillyFileFromBytes(nil), nil // empty file
-	case statusFile:
-		j := b.fs.statusJSON()
-		return newBillyFileFromBytes(j), nil
-	default:
-		return nil, os.ErrNotExist
-	}
-
-	ctx := context.TODO()
-
-	if ext := mp.CacheDownloadFileExt; ext != "" {
-		sp := b.fs.Stats.StartSpan("nfs.OpenFile-ext-" + ext)
-		v, err := b.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
-		sp.End(err)
-		if err != nil {
-			log.Printf("Failed to get %s file for %v: %v", mp.CacheDownloadFileExt, mp.ModVersion, err)
-			return nil, syscall.EIO
-		}
-		return newBillyFileFromBytes(v), nil
-	}
-
-	if !mp.InZip {
-		b.fs.Stats.StartSpan("nfs.Open-not-zip").End(nil)
-		return nil, errors.New("open of non-file")
-	}
-
-	mh, err := b.fs.getZipRoot(ctx, mp.ModVersion)
-	if err != nil {
-		return nil, err
-	}
-	spanGF := b.fs.Stats.StartSpan("nfs.OpenFile-GetFile")
-	contents, err := b.fs.Store.GetFile(ctx, mh, mp.Path)
-	if err != nil {
-		if errors.Is(err, store.ErrIsDir) {
-			return nil, fmt.Errorf("gomodfs OpenFile %q is a directory, not a file", filename)
-		}
-		spanGF.End(err)
-		return nil, err
-	}
-	spanGF.End(nil)
-	return newBillyFileFromBytes(contents), nil
-}
-
+func (b billyFS) Open(filename string) (billy.File, error) { panic("unreachable") }
 func (b billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
-	if flag != 0 {
-		log.Printf("gomodfs NFS OpenFile called with flag %d, but gomodfs is read-only", flag)
-		return nil, errReadonly
-	}
-	return b.Open(filename)
+	panic("unreachable")
 }
 
 func (b billyFS) Stat(filename string) (os.FileInfo, error) {
@@ -376,4 +310,182 @@ func (h *NFSHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
 
 func (h *NFSHandler) HandleLimit() int {
 	return math.MaxInt
+}
+
+func (n *NFSHandler) OnNFSRead(ctx context.Context, handleb []byte, offset uint64, count uint32) (*nfs.NFSReadResult, error) {
+	if len(handleb) != 64 {
+		log.Printf("non-64-length handle %q", handleb)
+		return nil, &nfs.NFSStatusError{
+			NFSStatus:  nfs.NFSStatusStale,
+			WrappedErr: errors.New("wrong length handle"),
+		}
+	}
+
+	handle := handle(handleb)
+	end := offset + uint64(count)
+
+	contents, attr, err := n.getFileContents(ctx, handle, end)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, &nfs.NFSStatusError{
+				NFSStatus:  nfs.NFSStatusNoEnt,
+				WrappedErr: err,
+			}
+		}
+		return nil, err
+	}
+
+	res := &nfs.NFSReadResult{
+		Attr: attr,
+	}
+	data := contents[min(uint64(len(contents)), offset):]
+	count = min(count, 16<<20)
+	if len(data) > int(count) {
+		data = data[:count]
+	}
+	res.Data = data
+	if int(offset)+len(data) == len(contents) {
+		res.EOF = true
+	}
+	return res, nil
+}
+
+func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint64) ([]byte, *nfs.FileAttribute, error) {
+	n.mu.Lock()
+	ent, ok := n.readCache[h]
+	if ok {
+		defer n.mu.Unlock()
+		ent.timer.Reset(10 * time.Second)
+		return ent.contents, ent.attr, nil
+	}
+
+	pathSeg, ok := n.handle[h]
+	n.mu.Unlock()
+	if !ok {
+		log.Printf("TODO: NFS FromHandle called with unknown handle %q", h)
+		return nil, nil, &nfs.NFSStatusError{
+			NFSStatus:  nfs.NFSStatusStale,
+			WrappedErr: errors.New("unknown handle"),
+		}
+	}
+
+	filename := strings.Join(pathSeg, "/")
+	contents, attr, err := n.getFileContentsUncached(ctx, filename)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if uint64(len(contents)) <= readEnd {
+		// The caller probably won't be coming back for more reads.
+		// No need to cache it.
+		return contents, attr, nil
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	ent = &readCacheEntry{
+		path:     filename,
+		contents: contents,
+		attr:     attr,
+		timer: time.AfterFunc(10*time.Second, func() {
+			n.removeFileCache(h)
+		}),
+	}
+	if n.readCache == nil {
+		n.readCache = map[handle]*readCacheEntry{}
+	}
+	n.readCache[h] = ent
+	return contents, attr, err
+}
+
+func (n *NFSHandler) removeFileCache(h handle) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	ent, ok := n.readCache[h]
+	if !ok {
+		return
+	}
+	log.Printf("NFS: dropping read cache entry for %q", ent.path)
+	delete(n.readCache, h)
+}
+
+func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename string) (data []byte, attr *nfs.FileAttribute, err error) {
+	attr = &nfs.FileAttribute{
+		Type:     nfs.FileTypeRegular,
+		FileMode: 0444, // unless overridden later
+		Nlink:    1,
+	}
+	hasher := fnv.New64()
+	_, _ = hasher.Write([]byte(filename))
+	attr.Fileid = hasher.Sum64()
+	attr.Atime = nfs.ToNFSTime(store.FakeStaticFileTime)
+	attr.Mtime = attr.Atime
+	attr.Ctime = attr.Atime
+
+	defer func() {
+		if err == nil {
+			attr.Filesize = uint64(len(data))
+			attr.Used = uint64(len(data))
+		}
+	}()
+
+	mp := parsePath(filename)
+	if mp.NotExist {
+		return nil, nil, os.ErrNotExist
+	}
+	switch mp.WellKnown {
+	case "":
+		// nothing
+	case "tsgo.extracted":
+		return nil, attr, nil
+	case statusFile:
+		j := n.fs.statusJSON()
+		return j, attr, nil
+	default:
+		return nil, nil, os.ErrNotExist
+	}
+
+	if ext := mp.CacheDownloadFileExt; ext != "" {
+		sp := n.fs.Stats.StartSpan("nfs.OpenFile-ext-" + ext)
+		v, err := n.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
+		sp.End(err)
+		if err != nil {
+			log.Printf("Failed to get %s file for %v: %v", mp.CacheDownloadFileExt, mp.ModVersion, err)
+			return nil, nil, err
+		}
+		return v, attr, nil
+	}
+
+	if !mp.InZip {
+		n.fs.Stats.StartSpan("nfs.Open-not-zip").End(nil)
+		return nil, nil, errors.New("open of non-file")
+	}
+
+	mh, err := n.fs.getZipRoot(ctx, mp.ModVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+	spanGF := n.fs.Stats.StartSpan("nfs.getFileContents-StatGetFile")
+
+	fi, err := n.fs.Store.Stat(ctx, mh, mp.Path)
+	if err != nil {
+		spanGF.End(err)
+		return nil, nil, err
+	}
+	if fi.IsDir() {
+		err = fmt.Errorf("gomodfs OpenFile %q is a directory, not a file", filename)
+		spanGF.End(err)
+		return nil, nil, err
+	}
+	attr.FileMode = uint32(fi.Mode().Perm())
+
+	contents, err := n.fs.Store.GetFile(ctx, mh, mp.Path)
+	if err != nil {
+		spanGF.End(err)
+		return nil, nil, err
+	}
+	spanGF.End(nil)
+	return contents, attr, nil
+
 }

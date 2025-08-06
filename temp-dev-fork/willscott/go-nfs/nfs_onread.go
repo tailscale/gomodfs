@@ -37,6 +37,40 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
+
+	resp := nfsReadResponse{}
+
+	if rh, ok := userHandle.(ReadHandler); ok {
+		nres, err := rh.OnNFSRead(ctx, obj.Handle, obj.Offset, obj.Count)
+		if err != nil {
+			if _, ok := err.(*NFSStatusError); ok {
+				return err
+			}
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		resp.Count = uint32(len(nres.Data))
+		resp.Data = nres.Data
+		if nres.EOF {
+			resp.EOF = 1
+		}
+
+		writer := bytes.NewBuffer([]byte{})
+		if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		if err := WritePostOpAttrs(writer, nres.Attr); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+
+		if err := xdr.Write(writer, resp); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		if err := w.Write(writer.Bytes()); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		return nil
+	}
+
 	fs, path, err := userHandle.FromHandle(obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
@@ -50,8 +84,6 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	defer fh.Close()
-
-	resp := nfsReadResponse{}
 
 	if obj.Count > CheckRead {
 		info, err := fs.Stat(fs.Join(path...))

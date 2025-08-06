@@ -33,6 +33,23 @@ type Handler interface {
 	HandleLimit() int
 }
 
+type NFSReadResult struct {
+	Data []byte
+	EOF  bool
+	Attr *FileAttribute
+}
+
+type ReadHandler interface {
+	Handler
+
+	// OnNFSRead is an optional [Handler] method for handlers
+	// that want to handle NFS read operations directly, bypassing
+	// the Billy abstractions.
+	//
+	// if it returns an error of type *NFSStatusError, it's returned unwrapped.
+	OnNFSRead(ctx context.Context, handle []byte, offset uint64, count uint32) (*NFSReadResult, error)
+}
+
 // UnixChange extends the billy `Change` interface with support for special files.
 type UnixChange interface {
 	billy.Change

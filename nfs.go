@@ -313,7 +313,10 @@ func (h *NFSHandler) billyFS() billyFS {
 	return billyFS{fs: h.fs, h: h}
 }
 
-func (h *NFSHandler) FromHandle(handleb []byte) (billy.Filesystem, []string, error) {
+func (h *NFSHandler) FromHandle(handleb []byte) (_ billy.Filesystem, segs []string, err error) {
+	sp := h.fs.Stats.StartSpan("nfs.FromHandle")
+	defer func() { defer sp.End(err) }()
+
 	if len(handleb) != 64 {
 		log.Printf("non-64-length handle %q", handleb)
 		return nil, nil, errors.New("invalid handle")

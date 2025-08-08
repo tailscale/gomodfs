@@ -30,8 +30,6 @@ var (
 	flagMountPoint = flag.String("mount", filepath.Join(os.Getenv("HOME"), "mnt-gomodfs"), "if set, mount the filesystem at this path")
 )
 
-// This demonstrates how to build a file system in memory. The
-// read/write logic for the file is provided by the MemRegularFile type.
 func main() {
 	flag.Parse()
 

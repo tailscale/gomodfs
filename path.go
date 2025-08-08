@@ -71,7 +71,8 @@ func parsePath(name string) (ret gmPath) {
 		ret.WellKnown = statusFile
 		return
 	}
-	if strings.HasPrefix(name, ".") {
+	base := path.Base(name)
+	if name != "" && strings.HasPrefix(base, ".") {
 		// .DS_Store, .Spotlight-V100, ._., .hidden,
 		// .metadata_never_index_unless_rootfs, ..metadata_never_index, etc
 		ret.NotExist = true

@@ -138,6 +138,21 @@ func TestParsePath(t *testing.T) {
 			path: "tsgo-darwin-arm64",
 			want: gmPath{},
 		},
+		{
+			// macOS client spam, trying to look for AppleDouble "sidecar" files
+			// for legacy HFS+ metadata.
+			path: "github.com/prometheus/client_golang/@v/._v0.9.1.mod",
+			want: gmPath{
+				NotExist: true,
+			},
+		},
+		{
+			// same as above, but with "cache/download".
+			path: "cache/download/go4.org/mem/@v/._v0.0.0-20240501181205-ae6ca9944745.mod",
+			want: gmPath{
+				NotExist: true,
+			},
+		},
 	}
 
 	for _, tt := range tests {

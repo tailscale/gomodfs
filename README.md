@@ -2,7 +2,7 @@
 
 # gomodfs
 
-`gomodfs` is a virtual filesystem (accessible via FUSE or WebDAV) that
+`gomodfs` is a virtual filesystem (supporting FUSE, WebDAV, and NFS) that
 implements a read-only filesystem emulating the [`GOMODCACHE` directory
 layout](https://go.dev/ref/mod#module-cache) that has all Go modules accessible,
 without making the `cmd/go` tool ever think it needs to download anything.
@@ -24,11 +24,24 @@ a writable disk, but then you can't run untrusted code.
 
 # Frontends
 
-`gomodfs` is accessible either via FUSE (best for Linux) or WebDAV, because FUSE
-on macOS can be tedious (allowlisting kernel extensions), especially on EC2 VMs
-requiring MDM policies to allowlist Team IDs. WebDAV is not ideal (there's no
-way to tell macOS cache validity information), so NFS should probably be
-implemented next.
+`gomodfs` is accessible either via FUSE, WebDAV, or NFS.
+
+FUSE is best for Linux. It's works on macOS too, but it's tedious,
+especially on EC2 VMs where you need to configure SIP & MDM to get it
+kernel extensions working.
+
+`gomodfs` also includes a WebDAV and NFS server.
+
+The WebDAV support came first and was found a little lacking (the
+macOS kernel forces `noexec` on those mounts), so we also added NFS support.
+
+Also, sharing either the WebDAV or FUSE mount over virtio-fs into Tart
+VMs hits bugs and limitations in Apple's virtio-fs implementation.
+See https://github.com/containers/podman/discussions/23886
+and https://github.com/docker/for-mac/issues/7059.
+
+As such, we ended up using NFS. `gomodfs` runs an NFS server on the host
+and we mount it in the guest VMs.
 
 # Backends
 

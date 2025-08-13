@@ -59,6 +59,8 @@ type FS struct {
 	// It should not have a trailing slash.
 	ModuleProxyURL string
 
+	Verbose bool
+
 	mu           sync.RWMutex
 	zipRootCache map[store.ModuleVersion]modHandleCacheEntry
 }
@@ -264,7 +266,9 @@ func (fs *FS) setZipRootCache(mv store.ModuleVersion, h store.ModHandle) {
 		h:        h,
 		lastUsed: now,
 	}
-	log.Printf("added zip root for %v to cache", mv)
+	if fs.Verbose {
+		log.Printf("added zip root for %v to cache", mv)
+	}
 }
 
 func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.ModHandle, err error) {
@@ -553,7 +557,9 @@ func (n *pathUnderZipRoot) Lookup(ctx context.Context, name string, out *fuse.En
 	defer n.mu.Unlock()
 
 	if err := n.initDirEntsLocked(ctx); err != nil {
-		log.Printf("Lookup(%v, %q, %q): %v", n.mv, n.path, name, err)
+		if n.fs.Verbose {
+			log.Printf("Lookup(%v, %q, %q): %v", n.mv, n.path, name, err)
+		}
 		return nil, syscall.EIO
 	}
 	setLongTTL(out)
@@ -628,7 +634,9 @@ func isReadonlyOpenFlags(flags uint32) bool {
 
 func (n *pathUnderZipRoot) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.mode.IsDir() {
-		log.Printf("Open called on directory %q", n.path)
+		if n.fs.Verbose {
+			log.Printf("Open called on directory %q", n.path)
+		}
 		return nil, 0, syscall.EISDIR
 	}
 	if !isReadonlyOpenFlags(flags) {
@@ -653,7 +661,9 @@ func (n *pathUnderZipRoot) Read(ctx context.Context, h fs.FileHandle, dest []byt
 	ctx = maybeIgnoreIgnoreContext(ctx)
 
 	if n.mode.IsDir() {
-		log.Printf("Read called on directory %q", n.path)
+		if n.fs.Verbose {
+			log.Printf("Read called on directory %q", n.path)
+		}
 		return nil, syscall.EISDIR
 	}
 

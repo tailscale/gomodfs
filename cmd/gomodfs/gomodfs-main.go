@@ -58,9 +58,10 @@ func main() {
 		Stats:   st,
 	}
 	mfs := &gomodfs.FS{
-		Git:   gitStore,
-		Store: gitStore,
-		Stats: st,
+		Git:     gitStore,
+		Store:   gitStore,
+		Stats:   st,
+		Verbose: *verbose,
 	}
 
 	if *debugListen != "" {

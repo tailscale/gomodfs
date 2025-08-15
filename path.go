@@ -72,16 +72,28 @@ func parsePath(name string) (ret gmPath) {
 		return
 	}
 	base := path.Base(name)
-	if name != "" && strings.HasPrefix(base, ".") {
-		// .DS_Store, .Spotlight-V100, ._., .hidden,
-		// .metadata_never_index_unless_rootfs, ..metadata_never_index, etc
-		ret.NotExist = true
-		return
-	}
+
+	// isDotFile is whether the base file is for a dotfile such as
+	// .DS_Store, .Spotlight-V100, ._., .hidden,
+	// .metadata_never_index_unless_rootfs, ..metadata_never_index, etc
+	// These may exist inside a zip, but they never exist elsewhere.
+	isDotFile := name != "" && strings.HasPrefix(base, ".")
+
 	if strings.HasPrefix(name, "tsgo-") {
+		if isDotFile {
+			// TODO(bradfitz): as far as I know, this is true (no useful dot
+			// files in the goroot), and this is what we did in earlier versions
+			// of gomodfs, so keep it for now.
+			ret.NotExist = true
+			return
+		}
 		return parseTSGoPath(name)
 	}
 	if dlSuffix, ok := strings.CutPrefix(name, "cache/download/"); ok {
+		if isDotFile {
+			ret.NotExist = true
+			return
+		}
 		escMod, escVer, ok := strings.Cut(dlSuffix, "/@v/")
 		if !ok {
 			// Not enough.
@@ -111,6 +123,10 @@ func parsePath(name string) (ret gmPath) {
 	// Zip path.
 	escMod, verAndPath, ok := strings.Cut(name, "@")
 	if !ok {
+		if isDotFile {
+			ret.NotExist = true
+			return
+		}
 		return
 	}
 	escVer, path, _ := strings.Cut(verAndPath, "/")

@@ -153,6 +153,18 @@ func TestParsePath(t *testing.T) {
 				NotExist: true,
 			},
 		},
+		{
+			// Don't ignore dot files in zips.
+			path: "tailscale.com@v1.87.0-pre.0.20250814204648-fbb91758ac41/release/dist/qnap/files/Tailscale/shared/ui/.htaccess",
+			want: gmPath{
+				InZip: true,
+				Path:  "release/dist/qnap/files/Tailscale/shared/ui/.htaccess",
+				ModVersion: store.ModuleVersion{
+					Module:  "tailscale.com",
+					Version: "v1.87.0-pre.0.20250814204648-fbb91758ac41",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

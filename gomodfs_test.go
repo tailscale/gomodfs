@@ -127,7 +127,7 @@ func TestFilesystem(t *testing.T) {
 			t.Logf("mount: %v", goModCacheDir)
 
 			store := &gitstore.Storage{GitRepo: "."}
-			mfs := &FS{Git: store, Store: store}
+			mfs := &FS{Store: store}
 
 			root := &moduleNameNode{
 				fs: mfs,

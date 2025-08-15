@@ -34,7 +34,6 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
-	"github.com/tailscale/gomodfs/store/gitstore"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
@@ -46,7 +45,6 @@ const (
 
 // FS is the gomodfs filesystem.
 type FS struct {
-	Git   *gitstore.Storage // legacy storage; TODO: remove this field, move all callers to Store interface
 	Store store.Store
 
 	Stats  *stats.Stats // or nil if stats are not enabled

@@ -26,6 +26,9 @@ var pathTests = []struct {
 	{path: "cache/", want: gmPath{}},
 	{path: "cache/download", want: gmPath{}},
 	{path: "cache/download/", want: gmPath{}},
+	{path: "cache/download/go4.org", want: gmPath{}},
+	{path: "cache/download/go4.org/mem", want: gmPath{}},
+	{path: "cache/download/go4.org/mem/@v", want: gmPath{}},
 	{
 		path: "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.ziphash",
 		want: gmPath{
@@ -97,7 +100,7 @@ var pathTests = []struct {
 				Module:  "github.com/tailscale/go",
 				Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
 			},
-			WellKnown: "tsgo.extracted",
+			WellKnown: wkTSGoExtracted,
 		},
 	},
 	{

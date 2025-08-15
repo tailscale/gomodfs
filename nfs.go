@@ -1,13 +1,13 @@
 package gomodfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
-	"log"
 	"math"
 	"net"
 	"os"
@@ -22,6 +22,7 @@ import (
 	"github.com/go-git/go-billy/v5"
 	"github.com/tailscale/gomodfs/store"
 	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
+	"tailscale.com/util/mak"
 )
 
 func (fs *FS) NFSHandler() nfs.Handler {
@@ -53,9 +54,14 @@ type NFSHandler struct {
 	nfs.Handler // temporary embedding during dev to watch what panics
 
 	mu          sync.Mutex
-	handle      map[handle][]string // => path segments
+	handle      map[handle]handleTarget
 	readCache   map[handle]*readCacheEntry
 	statusCache *statusMeta
+}
+
+type handleTarget struct {
+	path string   // the full path from the root, slash separated
+	segs []string // strings.Split(path, "/") form
 }
 
 // statusMeta is a snapshot of the [statusFile] contents:
@@ -139,14 +145,14 @@ func (b billyFS) Chroot(path string) (billy.Filesystem, error) {
 
 func (b billyFS) Root() string {
 	if b.fs.Verbose {
-		log.Printf("NFS: billyFS.Root called")
+		b.fs.logf("NFS: billyFS.Root called")
 	}
 	return "/"
 }
 
 func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	if b.fs.Verbose {
-		log.Printf("NFS ReadDir(%q)", path)
+		b.fs.logf("NFS ReadDir(%q)", path)
 	}
 	switch path {
 	case "":
@@ -206,10 +212,10 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	case statusFile:
 		m := b.h.statusFile()
 		return m.fi, nil
-	case "tsgo.extracted":
+	case wkTSGoExtracted:
 		return regFileInfo{
-			name:       "tsgo.extracted",
-			size:       0, // empty file
+			name:       "TODO-tsgo-hash.extracted", // TODO(bradfitz): does it matter?
+			size:       0,                          // empty file
 			mode:       0444,
 			modTimeNow: true,
 		}, nil
@@ -222,7 +228,7 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	if ext := mp.CacheDownloadFileExt; ext != "" {
 		v, err := b.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
 		if err != nil {
-			log.Printf("Failed to get %s file for %v: %v", ext, mp.ModVersion, err)
+			b.fs.logf("Failed to get %s file for %v: %v", ext, mp.ModVersion, err)
 			return nil, syscall.EIO
 		}
 		return regFileInfo{name: filepath.Base(filename), size: int64(len(v))}, nil
@@ -245,7 +251,7 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 			spSS.End(nil)
 			return nil, os.ErrNotExist
 		}
-		log.Printf("Failed to get file %q in zip for %v: %v", mp.Path, mp.ModVersion, err)
+		b.fs.logf("Failed to get file %q in zip for %v: %v", mp.Path, mp.ModVersion, err)
 		spSS.End(err)
 		return nil, err
 	}
@@ -258,7 +264,7 @@ func (b billyFS) Readlink(link string) (string, error) {
 }
 
 func (h *NFSHandler) Mount(ctx context.Context, c net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
-	log.Printf("NFS mount request from %s for %+v, %q", c.RemoteAddr(), req.Header, req.Dirpath)
+	h.fs.logf("NFS mount request from %s for %+v, %q", c.RemoteAddr(), req.Header, req.Dirpath)
 	return nfs.MountStatusOk, h.billyFS(), []nfs.AuthFlavor{nfs.AuthFlavorNull}
 }
 
@@ -271,6 +277,13 @@ func (h *NFSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.
 	return nil
 }
 
+var (
+	notExistHandle = []byte("\x00\xFF\x00Nope")
+	notExistSeg    = []string{".not-exist-path"}
+)
+
+const handleDebug = false
+
 func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	if len(path) == 0 {
 		return zeroHandle[:]
@@ -281,16 +294,24 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 
 	pathStr := strings.Join(path, "/")
 	pp := parsePath(pathStr)
+
+	if pp.NotExist {
+		return notExistHandle
+	}
+
 	ret := make([]byte, sha256.Size*2) // 64 bytes; max handle length w/ NFS v3
 
 	if pp.ModVersion.Module != "" {
-		s := sha256.New()
-		io.WriteString(s, pp.ModVersion.Module)
-		io.WriteString(s, pp.ModVersion.Version)
-		s.Sum(ret[:0])
+		hash := hashModVersion(pp.ModVersion)
+		copy(ret[:sha256.Size], hash[:])
 	}
-	if pp.CacheDownloadFileExt != "" {
-		_ = append(ret[sha256.Size:][:0], pp.CacheDownloadFileExt...)
+
+	if pp.WellKnown == wkTSGoExtracted {
+		hash := mkWellKnownPathHash(pp.WellKnown)
+		copy(ret[sha256.Size:], hash[:])
+	} else if pp.CacheDownloadFileExt != "" {
+		ph := mkWellKnownPathHash(pp.CacheDownloadFileExt)
+		copy(ret[sha256.Size:], ph[:])
 	} else {
 		s := sha256.New()
 		if pp.InZip {
@@ -303,12 +324,15 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.handle == nil {
-		h.handle = make(map[handle][]string)
-	}
 	handle := handle(ret)
 	if _, ok := h.handle[handle]; !ok {
-		h.handle[handle] = slices.Clone(path)
+		if handleDebug {
+			h.fs.logf("HANDLE: ToHandle(%q) => %02x", pathStr, handle)
+		}
+		mak.Set(&h.handle, handle, handleTarget{
+			path: pathStr,
+			segs: slices.Clone(path),
+		})
 	}
 	return ret
 }
@@ -321,32 +345,148 @@ func (h *NFSHandler) FromHandle(handleb []byte) (_ billy.Filesystem, segs []stri
 	sp := h.fs.Stats.StartSpan("nfs.FromHandle")
 	defer func() { defer sp.End(err) }()
 
+	if bytes.Equal(handleb, notExistHandle) {
+		return h.billyFS(), notExistSeg, nil
+	}
+
 	if len(handleb) != 64 {
-		log.Printf("non-64-length handle %q", handleb)
+		h.fs.logf("non-64-length handle %q", handleb)
 		return nil, nil, errors.New("invalid handle")
 	}
-	handle := handle(handleb)
+
+	ht, err := h.fromHandle(handle(handleb))
+	if err != nil {
+		if handleDebug {
+			h.fs.logf("HANDLE: FromHandle(%02x) error: %v", handleb, err)
+		}
+		return nil, nil, err
+	}
+	if handleDebug {
+		h.fs.logf("HANDLE: FromHandle(%02x) == %q", handleb, ht)
+	}
+	return h.billyFS(), ht.segs, nil
+}
+
+func staleErr(err error) error {
+	return &nfs.NFSStatusError{
+		NFSStatus:  nfs.NFSStatusStale,
+		WrappedErr: err,
+	}
+}
+
+// should return [staleErr] on a non-I/O-error-related miss.
+func (h *NFSHandler) fromHandle(handle handle) (ret handleTarget, err error) {
+	var zero handleTarget
 
 	if handle == zeroHandle {
-		return h.billyFS(), nil, nil
+		return zero, nil // zero target is the root
 	}
 	if handle == statusHandle {
-		return h.billyFS(), []string{statusFile}, nil
+		return mkTargetFromPath(statusFile), nil
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	pathSeg, ok := h.handle[handle]
-	if !ok {
-		log.Printf("TODO: NFS FromHandle called with unknown handle %q", handle)
-		return nil, nil, errors.New("unknown handle")
+	targ, ok := h.handle[handle]
+	h.mu.Unlock()
+	if ok {
+		return targ, nil
 	}
-	return h.billyFS(), slices.Clone(pathSeg), nil
+
+	// Populate handle cache for the future on any success below.
+	defer func() {
+		if err == nil {
+			if ret.path == "" || ret.segs == nil {
+				panic("shouldn't happen")
+			}
+			h.mu.Lock()
+			mak.Set(&h.handle, handle, ret)
+			h.mu.Unlock()
+		}
+	}()
+
+	modVerHash := modVerHash(handle[:sha256.Size]) // first 32 bytes are sha256(module version)
+	wantFileHash := pathHash(handle[sha256.Size:]) // second 32 bytes are sha256(file path)
+
+	if modVerHash.IsZero() {
+		return h.fs.handleTargetWithPathHash(wantFileHash)
+	}
+
+	// If we have a module version hash, we need to find the corresponding module version.
+	mv, err := h.fs.moduleVersionWithHash(modVerHash)
+	if err != nil {
+		return zero, err
+	}
+	if !mv.IsValid() {
+		h.fs.logf("miss mapping NFS handle %02x back to a module version", handle)
+		return zero, staleErr(fmt.Errorf("unknown module version from NFS handle %02x", handle))
+	}
+
+	switch wantFileHash {
+	case cdFileInfo:
+		return mkTargetFromPath(cdPath(mv, "info")), nil
+	case cdFileMod:
+		return mkTargetFromPath(cdPath(mv, "mod")), nil
+	case cdFileZiphash:
+		return mkTargetFromPath(cdPath(mv, "ziphash")), nil
+	case pathHashTSGo:
+		if trip, ok := isTSGoModule(mv); ok {
+			return mkTargetFromPath(tsGoZipRoot(trip) + ".extracted"), nil
+		}
+	}
+
+	ctx := context.TODO()
+	mh, err := h.fs.Store.GetZipRoot(ctx, mv)
+	if err != nil {
+		h.fs.logf("GetZipRoot error for %v: %v", mv, err)
+		return zero, errors.New("unknown module version in handle")
+	}
+
+	for pathRes := range h.fs.walkStoreModulePaths(ctx, mh) {
+		path, err := pathRes.Value()
+		if err != nil {
+			h.fs.logf("error getting path from walkStoreModulePaths: %v", err)
+			break
+		}
+		hash := mkPathHash(path)
+		if hash == wantFileHash {
+			prefix, err := modVerZipPrefix(mv)
+			if err != nil {
+				h.fs.logf("error getting zip prefix for %v: %v", mv, err)
+				break
+			}
+			return mkTargetFromPath(emptyPathJoin(prefix, path)), nil
+		}
+	}
+
+	err = fmt.Errorf("didn't find matching file for NFS handle in %v", mv)
+	h.fs.logf("miss inside zip root %v in FromHandle: %v", mv, err)
+	return zero, staleErr(err)
+}
+
+func mkTargetFromPath(path string) handleTarget {
+	return handleTarget{path: path, segs: splitSegs(path)}
+}
+
+func mkPathHash(path string) pathHash {
+	var hash [sha256.Size]byte
+	s2 := sha256.New()
+	io.WriteString(s2, path)
+	s2.Sum(hash[:0])
+	return hash
+}
+
+func emptyPathJoin(a, b string) string {
+	if b == "" {
+		return a
+	}
+	if a == "" {
+		return b
+	}
+	return a + "/" + b
 }
 
 func (h *NFSHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
-	log.Printf("NFS InvalidateHandle called with fs=%v, fh=%q", fs, fh)
+	h.fs.logf("NFS InvalidateHandle called with fs=%v, fh=%q", fs, fh)
 	return nil
 }
 
@@ -356,7 +496,7 @@ func (h *NFSHandler) HandleLimit() int {
 
 func (n *NFSHandler) OnNFSRead(ctx context.Context, handleb []byte, offset uint64, count uint32) (*nfs.NFSReadResult, error) {
 	if len(handleb) != 64 {
-		log.Printf("non-64-length handle %q", handleb)
+		n.fs.logf("non-64-length handle %q", handleb)
 		return nil, &nfs.NFSStatusError{
 			NFSStatus:  nfs.NFSStatusStale,
 			WrappedErr: errors.New("wrong length handle"),
@@ -396,11 +536,12 @@ func (n *NFSHandler) filenameLocked(h handle) (string, bool) {
 	if h == statusHandle {
 		return statusFile, true
 	}
-	pathSeg, ok := n.handle[h]
+	// TODO:
+	targ, ok := n.handle[h]
 	if !ok {
 		return "", false
 	}
-	return strings.Join(pathSeg, "/"), true
+	return targ.path, true
 }
 
 func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint64) ([]byte, *nfs.FileAttribute, error) {
@@ -411,16 +552,17 @@ func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint
 		ent.timer.Reset(10 * time.Second)
 		return ent.contents, ent.attr, nil
 	}
-
-	filename, ok := n.filenameLocked(h)
 	n.mu.Unlock()
-	if !ok {
-		log.Printf("TODO: NFS FromHandle called with unknown handle %q", h)
+
+	ht, err := n.fromHandle(h)
+	if err != nil {
+		n.fs.logf("TODO: NFS FromHandle error for %02x: %v", h, err)
 		return nil, nil, &nfs.NFSStatusError{
 			NFSStatus:  nfs.NFSStatusStale,
 			WrappedErr: errors.New("unknown handle"),
 		}
 	}
+	filename := ht.path
 
 	contents, attr, err := n.getFileContentsUncached(ctx, filename)
 	if err != nil {
@@ -494,7 +636,7 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 	switch mp.WellKnown {
 	case "":
 		// nothing
-	case "tsgo.extracted":
+	case wkTSGoExtracted:
 		return nil, attr, nil
 	case statusFile:
 		m := n.statusFile()
@@ -509,7 +651,7 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 		v, err := n.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
 		sp.End(err)
 		if err != nil {
-			log.Printf("Failed to get %s file for %v: %v", mp.CacheDownloadFileExt, mp.ModVersion, err)
+			n.fs.logf("Failed to get %s file for %v: %v", mp.CacheDownloadFileExt, mp.ModVersion, err)
 			return nil, nil, err
 		}
 		return v, attr, nil

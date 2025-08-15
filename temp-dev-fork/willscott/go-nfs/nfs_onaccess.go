@@ -39,7 +39,7 @@ func onAccess(ctx context.Context, w *response, userHandle Handler) error {
 	mask2 := mask
 	mask2 |= 1 // can read
 	mask2 |= 2 // can lookup
-	if attr.Type == FileTypeDirectory {
+	if attr != nil && attr.Type == FileTypeDirectory {
 		mask2 |= 0x20 // can search
 	}
 

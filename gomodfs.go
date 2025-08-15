@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"math"
 	"net"
@@ -37,6 +39,8 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
+	"tailscale.com/types/result"
+	"tailscale.com/util/testenv"
 )
 
 const (
@@ -57,10 +61,23 @@ type FS struct {
 	// It should not have a trailing slash.
 	ModuleProxyURL string
 
+	Logf func(format string, args ...any) // if non-nil, alternate logger to use
+
 	Verbose bool
 
-	mu           sync.RWMutex
-	zipRootCache map[store.ModuleVersion]modHandleCacheEntry
+	mu             sync.RWMutex
+	zipRootCache   map[store.ModuleVersion]modHandleCacheEntry
+	modVerHash     map[modVerHash]store.ModuleVersion // nil until first used
+	pathHashTarget map[pathHash]handleTarget          // nil until first used
+}
+
+func hashModVersion(mv store.ModuleVersion) (ret modVerHash) {
+	s := sha256.New()
+	io.WriteString(s, mv.Module)
+	io.WriteString(s, "\x00")
+	io.WriteString(s, mv.Version)
+	s.Sum(ret[:0])
+	return
 }
 
 type modHandleCacheEntry struct {
@@ -147,6 +164,21 @@ func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) (_ [
 	return vi.([]byte), nil
 }
 
+func (fs *FS) netLogf(format string, arg ...any) {
+	if testenv.InTest() && fs.Client != nil {
+		format = "[fake-network] " + format
+	}
+	fs.logf(format, arg...)
+}
+
+func (fs *FS) logf(format string, arg ...any) {
+	if fs.Logf != nil {
+		fs.Logf(format, arg...)
+	} else {
+		log.Printf(format, arg...)
+	}
+}
+
 func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
 	baseURL, err := fs.modURLBase(mv)
 	if err != nil {
@@ -163,7 +195,6 @@ func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.Mo
 			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
 		}
 		download[ext] = data
-		log.Printf("Downloaded %d bytes from %v", len(data), urlStr)
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(download["zip"]), int64(len(download["zip"])))
@@ -220,11 +251,16 @@ func (fs *FS) netSlurp(ctx0 context.Context, urlStr string) (ret []byte, err err
 	ctx, cancel := context.WithTimeout(ctx0, 30*time.Second)
 	defer cancel()
 
+	t0 := time.Now()
 	defer func() {
 		if err != nil && ctx0.Err() == nil {
-			log.Printf("netSlurp(%q) failed: %v", urlStr, err)
+			fs.logf("netSlurp(%q) failed: %v", urlStr, err)
+		} else if err == nil {
+			fs.netLogf("downloaded %s (%d bytes) in %v", urlStr, len(ret), time.Since(t0).Round(time.Millisecond))
 		}
 	}()
+
+	fs.netLogf("starting download of %q ...", urlStr)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
@@ -257,6 +293,12 @@ func (fs *FS) setZipRootCache(mv store.ModuleVersion, h store.ModHandle) {
 	defer fs.mu.Unlock()
 	if fs.zipRootCache == nil {
 		fs.zipRootCache = make(map[store.ModuleVersion]modHandleCacheEntry)
+	}
+	if fs.modVerHash != nil {
+		// If it's already initialized, add new stuff to it.
+		// Otherwise if it's nil, it'll get populated later.
+		fs.modVerHash[hashModVersion(mv)] = mv
+		fs.addModuleVersionPathsLocked(mv)
 	}
 	now := new(atomic.Int64)
 	now.Store(time.Now().Unix())
@@ -372,6 +414,162 @@ func (fs *FS) getZiphash(ctx context.Context, mv store.ModuleVersion) (data []by
 		return nil, err
 	}
 	return fs.Store.GetZipHash(ctx, zr)
+}
+
+func (fs *FS) walkStoreModulePaths(ctx context.Context, mh store.ModHandle) iter.Seq[result.Of[string]] {
+	return func(yield func(result.Of[string]) bool) {
+		var doDir func(string) bool // recursive dir walker, called with "" (root) or "path/to/file-or-dir"
+		doDir = func(path string) bool {
+			if !yield(result.Value(path)) {
+				return false
+			}
+			ents, err := fs.Store.Readdir(ctx, mh, path)
+			if err != nil {
+				yield(result.Error[string](err))
+				return false
+			}
+			for _, ent := range ents {
+				sub := ent.Name
+				if path != "" {
+					sub = path + "/" + ent.Name
+				}
+				if ent.Mode.IsDir() {
+					if !doDir(sub) {
+						return false
+					}
+				} else {
+					if !yield(result.Value(sub)) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		doDir("")
+	}
+}
+
+// modVerHash is SHA256(store.ModuleVersion).
+type modVerHash [sha256.Size]byte
+
+func (h modVerHash) IsZero() bool { return h == modVerHash{} }
+
+// pathHash is SHA256(either abs path or path-within-a-zip)
+type pathHash [sha256.Size]byte
+
+var (
+	cdFileInfo    = mkWellKnownPathHash("info")
+	cdFileMod     = mkWellKnownPathHash("mod")
+	cdFileZiphash = mkWellKnownPathHash("ziphash")
+	pathHashTSGo  = mkWellKnownPathHash(wkTSGoExtracted)
+)
+
+func mkWellKnownPathHash(s string) pathHash {
+	var h pathHash
+	copy(h[:], s)
+	return h
+}
+
+// returns (v, nil) on hit, (zero, nil) on miss, or (zero, err) on error.
+func (fs *FS) moduleVersionWithHash(mvh modVerHash) (mv store.ModuleVersion, err error) {
+	var zero store.ModuleVersion
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if err := fs.initHandleMapsLocked(); err != nil {
+		fs.logf("initHandleMapsLocked error: %v", err)
+		return zero, err
+	}
+	return fs.modVerHash[mvh], nil
+}
+
+func (fs *FS) initHandleMapsLocked() error {
+	if fs.modVerHash != nil {
+		return nil
+	}
+
+	mvs, err := fs.Store.CachedModules(context.TODO())
+	if err != nil {
+		return fmt.Errorf("CachedModules: %w", err)
+	}
+
+	fs.modVerHash = make(map[modVerHash]store.ModuleVersion)
+	fs.pathHashTarget = make(map[pathHash]handleTarget)
+
+	for _, mv := range mvs {
+		fs.modVerHash[hashModVersion(mv)] = mv
+		fs.addModuleVersionPathsLocked(mv)
+	}
+
+	for _, path := range []string{
+		"cache",
+		"cache/download",
+		statusFile,
+	} {
+		fs.addPathHashTargetLocked(path)
+	}
+	for _, goos := range tsGoGeese {
+		for _, goarch := range tsGoGoarches {
+			fs.addPathHashTargetLocked(fmt.Sprintf("tsgo-%s-%s", goos, goarch))
+		}
+	}
+
+	return nil
+}
+
+// should return [staleErr] on non-I/O-error-related miss.
+func (fs *FS) handleTargetWithPathHash(ph pathHash) (handleTarget, error) {
+	var zero handleTarget
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if err := fs.initHandleMapsLocked(); err != nil {
+		return zero, err
+	}
+
+	ht, ok := fs.pathHashTarget[ph]
+	if !ok {
+		return zero, staleErr(fmt.Errorf("unknown path hash %02x", ph))
+	}
+	return ht, nil
+}
+
+func (fs *FS) addModuleVersionPathsLocked(mv store.ModuleVersion) {
+	// Make "cache/download/github.com/foo/bar/@v/v1.2.3.foo" and then walk up
+	// its directories to add them to the cache. We don't care about the "foo"
+	// final component; just the directories above it.
+	fs.addParentPathsLocked(cdPath(mv, "foo"))
+
+	// Now add the zip root directories above the one with the "@" in it.
+	// e.g. "github.com/!azure/azure-sdk-for-go/sdk" components above
+	// "github.com/!azure/azure-sdk-for-go/sdk/azcore@v1.11.0"
+	path, err := modVerZipPrefix(mv)
+	if err == nil {
+		fs.addParentPathsLocked(path)
+	} else {
+		fs.logf("failed to get modVerZipPrefix for %v: %v", mv, err)
+	}
+}
+
+func (fs *FS) addParentPathsLocked(s string) {
+	for {
+		s = filepath.Dir(s)
+		switch s {
+		case ".", "cache", "cache/download":
+			// Stop once you see any of these.
+			// They're all well-known already, so we're done.
+			return
+		}
+		fs.addPathHashTargetLocked(s)
+	}
+}
+
+func (fs *FS) addPathHashTargetLocked(path string) {
+	fs.pathHashTarget[mkPathHash(path)] = handleTarget{
+		path: path,
+		segs: splitSegs(path),
+	}
 }
 
 type moduleNameNode struct {
@@ -702,6 +900,40 @@ func (n *pathUnderZipRoot) Read(ctx context.Context, h fs.FileHandle, dest []byt
 		end = len(n.fileContent)
 	}
 	return fuse.ReadResultData(n.fileContent[int(off):end]), 0
+}
+
+// cdPath returns the "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.foo" file.
+// It returns an invalid path if mv is invalid or malformed.
+func cdPath(mv store.ModuleVersion, ext string) string {
+	escMod, _ := module.EscapePath(mv.Module)
+	escVer, _ := module.EscapeVersion(mv.Version)
+	return "cache/download/" + escMod + "/@v/" + escVer + "." + ext
+}
+
+func joinSegs(s []string) string {
+	return strings.Join(s, "/")
+}
+
+func splitSegs(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "/")
+}
+
+func modVerZipPrefix(mv store.ModuleVersion) (string, error) {
+	if trip, ok := isTSGoModule(mv); ok {
+		return tsGoZipRoot(trip), nil
+	}
+	modEsc, err := module.EscapePath(mv.Module)
+	if err != nil {
+		return "", err
+	}
+	verEsc, err := module.EscapeVersion(mv.Version)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s@%s", modEsc, verEsc), nil
 }
 
 type memFile struct {

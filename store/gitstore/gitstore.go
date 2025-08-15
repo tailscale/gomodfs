@@ -38,6 +38,7 @@ import (
 	"github.com/tailscale/gomodfs/store"
 	"go4.org/mem"
 	"golang.org/x/mod/module"
+	"tailscale.com/util/set"
 )
 
 type Storage struct {
@@ -977,4 +978,52 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {
 	mh := h.(*modHandle)
 	return slices.Clone(mh.dirEnts[path]), nil
+}
+
+func (s *Storage) CachedModules(ctx context.Context) ([]store.ModuleVersion, error) {
+	sp := s.Stats.StartSpan("gitstore-CachedModules")
+	defer sp.End(nil)
+
+	cmd := s.git("for-each-ref", "--format=%(refname:short)", "refs/gomod/")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list git refs: %w, %s", err, out)
+	}
+
+	var mods []store.ModuleVersion
+	seen := set.Set[store.ModuleVersion]{}
+	for line := range bytes.SplitSeq(out, []byte{'\n'}) {
+		paren := bytes.IndexByte(line, '(')
+		if paren != -1 {
+			line = line[:paren] // remove (mod) etc suffix
+		}
+		rest, ok := strings.CutPrefix(string(line), "gomod/")
+		if !ok {
+			continue
+		}
+		modEsc2, verEsc2, ok := strings.Cut(rest, "@")
+		if !ok {
+			continue
+		}
+		modEsc, err1 := url.PathUnescape(modEsc2)
+		verEsc, err2 := url.PathUnescape(verEsc2)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		mod, err1 := module.UnescapePath(modEsc)
+		ver, err2 := module.UnescapeVersion(verEsc)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		mv := store.ModuleVersion{
+			Module:  mod,
+			Version: ver,
+		}
+		if seen.Contains(mv) {
+			continue
+		}
+		seen.Add(mv)
+		mods = append(mods, mv)
+	}
+	return mods, nil
 }

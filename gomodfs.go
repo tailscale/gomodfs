@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"math"
 	"net"
@@ -37,6 +39,8 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
+	"tailscale.com/types/result"
+	"tailscale.com/util/testenv"
 )
 
 const (
@@ -57,10 +61,22 @@ type FS struct {
 	// It should not have a trailing slash.
 	ModuleProxyURL string
 
+	Logf func(format string, args ...any) // if non-nil, alternate logger to use
+
 	Verbose bool
 
 	mu           sync.RWMutex
 	zipRootCache map[store.ModuleVersion]modHandleCacheEntry
+	modVerHash   map[modVerHash]store.ModuleVersion // nil until first used
+}
+
+func hashModVersion(mv store.ModuleVersion) (ret modVerHash) {
+	s := sha256.New()
+	io.WriteString(s, mv.Module)
+	io.WriteString(s, "\x00")
+	io.WriteString(s, mv.Version)
+	s.Sum(ret[:0])
+	return
 }
 
 type modHandleCacheEntry struct {
@@ -147,6 +163,21 @@ func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) (_ [
 	return vi.([]byte), nil
 }
 
+func (fs *FS) netLogf(format string, arg ...any) {
+	if testenv.InTest() && fs.Client != nil {
+		format = "[fake-network] " + format
+	}
+	fs.logf(format, arg...)
+}
+
+func (fs *FS) logf(format string, arg ...any) {
+	if fs.Logf != nil {
+		fs.Logf(format, arg...)
+	} else {
+		log.Printf(format, arg...)
+	}
+}
+
 func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
 	baseURL, err := fs.modURLBase(mv)
 	if err != nil {
@@ -163,7 +194,7 @@ func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.Mo
 			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
 		}
 		download[ext] = data
-		log.Printf("Downloaded %d bytes from %v", len(data), urlStr)
+		fs.netLogf("Downloaded %d bytes from %v", len(data), urlStr)
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(download["zip"]), int64(len(download["zip"])))
@@ -257,6 +288,11 @@ func (fs *FS) setZipRootCache(mv store.ModuleVersion, h store.ModHandle) {
 	defer fs.mu.Unlock()
 	if fs.zipRootCache == nil {
 		fs.zipRootCache = make(map[store.ModuleVersion]modHandleCacheEntry)
+	}
+	if fs.modVerHash != nil {
+		// If it's already initialized, add new stuff to it.
+		// Otherwise if it's nil, it'll get populated later.
+		fs.modVerHash[hashModVersion(mv)] = mv
 	}
 	now := new(atomic.Int64)
 	now.Store(time.Now().Unix())
@@ -372,6 +408,70 @@ func (fs *FS) getZiphash(ctx context.Context, mv store.ModuleVersion) (data []by
 		return nil, err
 	}
 	return fs.Store.GetZipHash(ctx, zr)
+}
+
+func (fs *FS) walkStoreModulePaths(ctx context.Context, mh store.ModHandle) iter.Seq[result.Of[string]] {
+	return func(yield func(result.Of[string]) bool) {
+		var doDir func(string) bool // recursive dir walker, called with "" (root) or "path/to/file-or-dir"
+		doDir = func(path string) bool {
+			if !yield(result.Value(path)) {
+				return false
+			}
+			ents, err := fs.Store.Readdir(ctx, mh, path)
+			if err != nil {
+				yield(result.Error[string](err))
+				return false
+			}
+			for _, ent := range ents {
+				sub := ent.Name
+				if path != "" {
+					sub = path + "/" + ent.Name
+				}
+				if ent.Mode.IsDir() {
+					if !doDir(sub) {
+						return false
+					}
+				} else {
+					if !yield(result.Value(sub)) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		doDir("")
+	}
+}
+
+// modVerHash is SHA256(store.ModuleVersion).
+type modVerHash [sha256.Size]byte
+
+func (fs *FS) moduleVersionWithHash(mvh [sha256.Size]byte) (mv store.ModuleVersion, ok bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if err := fs.initModVerHashLocked(); err != nil {
+		fs.logf("initModVerHashLocked error: %v", err)
+		return mv, false
+	}
+	mv, ok = fs.modVerHash[mvh]
+	return
+}
+
+func (fs *FS) initModVerHashLocked() error {
+	if fs.modVerHash != nil {
+		return nil
+	}
+
+	mvs, err := fs.Store.CachedModules(context.TODO())
+	if err != nil {
+		return fmt.Errorf("CachedModules: %w", err)
+	}
+
+	fs.modVerHash = make(map[modVerHash]store.ModuleVersion)
+	for _, mv := range mvs {
+		fs.modVerHash[hashModVersion(mv)] = mv
+	}
+	return nil
 }
 
 type moduleNameNode struct {

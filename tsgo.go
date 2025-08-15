@@ -22,7 +22,13 @@ import (
 	"github.com/tailscale/gomodfs/store"
 )
 
+var (
+	tsGoGeese    = []string{"linux", "darwin", "windows"}
+	tsGoGoarches = []string{"amd64", "arm64"}
+)
+
 func validTSGoOSARCH(goos, goarch string) bool {
+	// Keep this in sync with above.
 	switch goos {
 	case "linux", "darwin", "windows":
 	default:

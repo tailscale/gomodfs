@@ -1,6 +1,8 @@
 module github.com/tailscale/gomodfs
 
-go 1.23.4
+go 1.24.4
+
+toolchain go1.24.6
 
 require (
 	github.com/go-git/go-billy/v5 v5.6.2
@@ -13,6 +15,7 @@ require (
 	golang.org/x/mod v0.26.0
 	golang.org/x/net v0.42.0
 	golang.org/x/sync v0.16.0
+	tailscale.com v1.86.4
 )
 
 require (

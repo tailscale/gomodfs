@@ -14,6 +14,10 @@ var ErrIsDir = errors.New("is a directory")
 
 // Store defines the cache storage interface for gomodfs.
 type Store interface {
+	// CachedModules returns all the ModuleVersions currently known,
+	// even if they're not fully downloaded.
+	CachedModules(context.Context) ([]ModuleVersion, error)
+
 	// GetZipRoot returns a handle to the root of a module's zip file for a given version.
 	// If the module is not cached, it should return ErrCacheMiss.
 	GetZipRoot(context.Context, ModuleVersion) (ModHandle, error)
@@ -79,6 +83,10 @@ type Dirent struct {
 type ModuleVersion struct {
 	Module  string // unescaped, in original case (e.g. "github.com/Foo/bar")
 	Version string // unescaped, in original case (e.g. "v1.2.3")
+}
+
+func (mv ModuleVersion) IsValid() bool {
+	return mv.Module != "" && mv.Version != ""
 }
 
 type ModHandle interface{}

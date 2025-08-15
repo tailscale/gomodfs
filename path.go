@@ -200,6 +200,10 @@ var tsGoVersion = funcSmallSet(func(triple tsgoTriple) string {
 	return fmt.Sprintf("tsgo-%s-%s-%s", triple.OS, triple.Arch, triple.Hash)
 })
 
+var tsGoZipRoot = funcSmallSet(func(triple tsgoTriple) string {
+	return fmt.Sprintf("tsgo-%s-%s/%s", triple.OS, triple.Arch, triple.Hash)
+})
+
 type escPair struct {
 	EscMod string
 	EscVer string

@@ -22,7 +22,15 @@ import (
 	"github.com/tailscale/gomodfs/store"
 )
 
+var (
+	tsGoGeese    = []string{"linux", "darwin", "windows"}
+	tsGoGoarches = []string{"amd64", "arm64"}
+)
+
+const wkTSGoExtracted = "tsgo.extracted"
+
 func validTSGoOSARCH(goos, goarch string) bool {
+	// Keep this in sync with above.
 	switch goos {
 	case "linux", "darwin", "windows":
 	default:
@@ -112,6 +120,27 @@ func (f tsgoFile) Size() int64                  { return int64(len(f.content)) }
 func (f tsgoFile) Open() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(f.content)), nil }
 func (f tsgoFile) Mode() os.FileMode            { return f.mode }
 
+func isTSGoModule(mv store.ModuleVersion) (ret tsgoTriple, ok bool) {
+	if mv.Module != "github.com/tailscale/go" {
+		return
+	}
+	// mv.Version is "tsgo-GOOS-GOARCH-HASH"
+	rest, ok := strings.CutPrefix(mv.Version, "tsgo-")
+	if !ok {
+		return
+	}
+	// rest is "GOOS-GOARCH-HASH"
+	goos, rest, ok := strings.Cut(rest, "-")
+	if !ok {
+		return
+	}
+	goarch, hash, ok := strings.Cut(rest, "-")
+	if !ok {
+		return
+	}
+	return tsgoTriple{OS: goos, Arch: goarch, Hash: hash}, true
+}
+
 func (fs *FS) getTailscaleGoRoot(ctx context.Context, goos, goarch, commitHash string) (store.ModuleVersion, store.ModHandle, error) {
 
 	mv := store.ModuleVersion{
@@ -132,7 +161,7 @@ func (fs *FS) getTailscaleGoRoot(ctx context.Context, goos, goarch, commitHash s
 
 	// If it doesn't exist, download the tarball.
 	urlStr := fmt.Sprintf("https://github.com/tailscale/go/releases/download/build-%s/%s-%s.tar.gz", commitHash, goos, goarch)
-	log.Printf("Downloading %q", urlStr)
+	fs.netLogf("starting download of %q ...", urlStr)
 	tgz, err := fs.netSlurp(ctx, urlStr)
 	if err != nil {
 		return mv, "", fmt.Errorf("failed to download %q: %w", urlStr, err)

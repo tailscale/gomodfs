@@ -72,9 +72,7 @@ func parsePath(name string) (ret gmPath) {
 		return
 	}
 	base := path.Base(name)
-	if name != "" && strings.HasPrefix(base, ".") {
-		// .DS_Store, .Spotlight-V100, ._., .hidden,
-		// .metadata_never_index_unless_rootfs, ..metadata_never_index, etc
+	if name != "" && isMetadataFile(base) {
 		ret.NotExist = true
 		return
 	}
@@ -124,6 +122,34 @@ func parsePath(name string) (ret gmPath) {
 	}
 
 	return
+}
+
+// isMetadataFile returns true if the filename suggests that this is a metadata
+// file that should not legitimately be part of any Go module and is being
+// queried by mistake. The hardcoded list currently assumes running on MacOS.
+func isMetadataFile(basename string) bool {
+	if !strings.HasPrefix(basename, ".") {
+		return false
+	}
+
+	// AppleDouble resource fork files
+	if strings.HasPrefix(basename, "._") {
+		return true
+	}
+	switch basename {
+	case ".DS_Store",
+		".Spotlight-V100",
+		".fseventsd",
+		".Trashes",
+		".TemporaryItems",
+		".VolumeIcon.icns",
+		".localized",
+		".metadata_never_index",
+		".metadata_never_index_unless_rootfs",
+		".DocumentRevisions-V100":
+		return true
+	}
+	return false
 }
 
 func parseTSGoPath(name string) (ret gmPath) {

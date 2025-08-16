@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,7 +19,12 @@ import (
 
 var debugFUSE = flag.Bool("debug-fuse", false, "verbose FUSE debugging")
 
+var hitNetwork = flag.Bool("run-network-tests", false, "run network tests")
+
 func TestFilesystem(t *testing.T) {
+	if !*hitNetwork {
+		t.Skip("Skipping network tests; set --run-network-tests to run them")
+	}
 
 	type testEnv struct {
 		*testing.T
@@ -125,9 +131,19 @@ func TestFilesystem(t *testing.T) {
 
 			goModCacheDir := t.TempDir()
 			t.Logf("mount: %v", goModCacheDir)
+			gitDir := t.TempDir()
 
-			store := &gitstore.Storage{GitRepo: "."}
-			mfs := &FS{Store: store}
+			cmd := exec.Command("git", "init", gitDir)
+			cmd.Dir = gitDir
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("Failed to init git repo: %v", err)
+			}
+
+			store := &gitstore.Storage{GitRepo: gitDir}
+			mfs := &FS{
+				Store:   store,
+				Verbose: true,
+			}
 
 			root := &moduleNameNode{
 				fs: mfs,

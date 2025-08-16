@@ -2,9 +2,12 @@ package gomodfs
 
 import (
 	"fmt"
+	"maps"
 	"path"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tailscale/gomodfs/store"
 	"golang.org/x/mod/module"
@@ -142,6 +145,10 @@ func parsePath(name string) (ret gmPath) {
 	return
 }
 
+func isHexChar(r rune) bool {
+	return r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F'
+}
+
 func parseTSGoPath(name string) (ret gmPath) {
 	name, ok := strings.CutPrefix(name, "tsgo-")
 	if !ok {
@@ -160,15 +167,20 @@ func parseTSGoPath(name string) (ret gmPath) {
 		return
 	}
 	firstSeg, rest, _ := strings.Cut(rest, "/")
-	m := tsgoRootLookupRx.FindStringSubmatch(firstSeg)
-	if m == nil {
+
+	hash, wantExtractedFile := strings.CutSuffix(firstSeg, ".extracted")
+	if len(hash) != 40 {
 		ret.NotExist = true
-		return
 	}
-	hash, wantExtractedFile := m[1], m[2] != ""
+	for _, b := range hash {
+		if !isHexChar(b) {
+			ret.NotExist = true
+			return
+		}
+	}
 
 	ret.ModVersion.Module = "github.com/tailscale/go"
-	ret.ModVersion.Version = fmt.Sprintf("tsgo-%s-%s-%s", goos, goarch, hash)
+	ret.ModVersion.Version = tsGoVersion(tsgoTriple{OS: goos, Arch: goarch, Hash: hash})
 	if wantExtractedFile {
 		ret.WellKnown = "tsgo.extracted"
 		return
@@ -178,7 +190,31 @@ func parseTSGoPath(name string) (ret gmPath) {
 	return ret
 }
 
+type tsgoTriple struct {
+	OS   string
+	Arch string
+	Hash string
+}
+
+var tsGoVersion = funcSmallSet(func(triple tsgoTriple) string {
+	return fmt.Sprintf("tsgo-%s-%s-%s", triple.OS, triple.Arch, triple.Hash)
+})
+
+type escPair struct {
+	EscMod string
+	EscVer string
+}
+
+// seePairs memoizes [parseModVersion].
+// It grows unbounded, which in practice is fine.
+var seenPairs sync.Map // escPair -> store.ModuleVersion
+
 func parseModVersion(escMod, escVer string) (mv store.ModuleVersion, ok bool) {
+	pair := escPair{EscMod: escMod, EscVer: escVer}
+	if v, ok := seenPairs.Load(pair); ok {
+		return v.(store.ModuleVersion), true
+	}
+
 	var err error
 	mv.Module, err = module.UnescapePath(escMod)
 	if err != nil {
@@ -188,5 +224,55 @@ func parseModVersion(escMod, escVer string) (mv store.ModuleVersion, ok bool) {
 	if err != nil {
 		return mv, false
 	}
+
+	seenPairs.Store(pair, mv)
 	return mv, true
+}
+
+// funcSmallSet returns a memoized version of f.
+//
+// The implementation assumption is that the the set of possible K values is
+// small. The implementation re-clones the prior map of all previous keys
+// and values whenever a new key is seen.
+//
+// f should be a pure function (free of side effects and deterministic).
+func funcSmallSet[K comparable, V any](f func(K) V) func(K) V {
+	var latestMap atomic.Value
+	var mu sync.Mutex
+
+	// TODO(bradfitz): if Go 1.24's internal/sync.HashTrieMap is ever exported,
+	// perhaps via a new generic version of sync.Map (Go 1.24's sync.Map is just
+	// the any/any instantiation of internal/sync.HashTrieMap), then we should
+	// use that here instead. But tailscale.com's syncs.Map (mutex + normal map) and
+	// std sync.Map are both sad for concurrency + boxing-into-interface reasons,
+	// respectively. So do a lame non-scalable version (that only works for small sets
+	// of items) instead, naming the func appropriately to scare off users who might
+	// use it for tons of items)
+
+	return func(k K) V {
+		latest, _ := latestMap.Load().(map[K]V)
+
+		if v, ok := latest[k]; ok {
+			return v // common case
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		latest, _ = latestMap.Load().(map[K]V)
+		if v, ok := latest[k]; ok {
+			return v // lost fill race
+		}
+
+		v := f(k)
+
+		clone := maps.Clone(latest)
+		if clone == nil {
+			clone = make(map[K]V)
+		}
+		clone[k] = v
+		latestMap.Store(clone)
+
+		return v
+	}
 }

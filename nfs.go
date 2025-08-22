@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 package gomodfs
 
 import (
@@ -15,7 +18,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -26,7 +28,6 @@ import (
 )
 
 func (fs *FS) NFSHandler() nfs.Handler {
-	// Create a new NFS handler that uses the gomodfs file system.
 	return &NFSHandler{fs: fs}
 }
 
@@ -49,14 +50,8 @@ var zeroHandle handle
 var statusHandle = handle{0: 'S', 1: 'T', 2: 'A', 3: 'T', 4: 'U', 5: 'S'}
 
 type NFSHandler struct {
-	fs *FS
-
+	fs          *FS
 	nfs.Handler // temporary embedding during dev to watch what panics
-
-	mu          sync.Mutex
-	handle      map[handle]handleTarget
-	readCache   map[handle]*readCacheEntry
-	statusCache *statusMeta
 }
 
 type handleTarget struct {
@@ -74,14 +69,15 @@ type statusMeta struct {
 
 // statusFile generates or returns a recent snapshot of the status file.
 func (h *NFSHandler) statusFile() *statusMeta {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	fs := h.fs
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	const regenEvery = 2 * time.Second
-	if h.statusCache != nil && time.Since(h.statusCache.fi.ModTime()) < regenEvery {
-		return h.statusCache
+	if fs.statusCache != nil && time.Since(fs.statusCache.fi.ModTime()) < regenEvery {
+		return fs.statusCache
 	}
 	j := h.fs.statusJSON()
-	h.statusCache = &statusMeta{
+	fs.statusCache = &statusMeta{
 		fi: regFileInfo{
 			name:    statusFile,
 			size:    int64(len(j)),
@@ -90,15 +86,15 @@ func (h *NFSHandler) statusFile() *statusMeta {
 		},
 		json: j,
 	}
-	return h.statusCache
+	return fs.statusCache
 }
 
 type readCacheEntry struct {
-	contents []byte
-	path     string
 	attr     *nfs.FileAttribute
-	timer    *time.Timer // for the AfterFunc to remove it from the cache
+	blobHash blobHash
 }
+
+type blobHash [sha256.Size]byte
 
 var (
 	_ nfs.Handler     = (*NFSHandler)(nil)
@@ -202,6 +198,12 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 }
 
 func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
+	// TODO(bradfitz): if the NFS layer passed in the NFS handle here (like if
+	// we bypassed BillyFS and added a lower level NFS path like we did for
+	// OnNFSRead), then we could check the NFS handle read cache and get its
+	// attributes directy, without the hop through parsing the path and looking
+	// up the ModHandle and then checking the git storage maps.
+
 	mp := parsePath(filename)
 	if mp.NotExist {
 		return nil, os.ErrNotExist
@@ -260,7 +262,7 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 }
 
 func (b billyFS) Readlink(link string) (string, error) {
-	panic(fmt.Sprintf("TODO billy Readlink(%q)", link))
+	panic("unused")
 }
 
 func (h *NFSHandler) Mount(ctx context.Context, c net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
@@ -284,7 +286,7 @@ var (
 
 const handleDebug = false
 
-func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
+func (h *NFSHandler) ToHandle(_ billy.Filesystem, path []string) []byte {
 	if len(path) == 0 {
 		return zeroHandle[:]
 	}
@@ -322,14 +324,15 @@ func (h *NFSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 		s.Sum(ret[sha256.Size:][:0])
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	fs := h.fs
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	handle := handle(ret)
-	if _, ok := h.handle[handle]; !ok {
+	if _, ok := fs.handle[handle]; !ok {
 		if handleDebug {
 			h.fs.logf("HANDLE: ToHandle(%q) => %02x", pathStr, handle)
 		}
-		mak.Set(&h.handle, handle, handleTarget{
+		mak.Set(&fs.handle, handle, handleTarget{
 			path: pathStr,
 			segs: slices.Clone(path),
 		})
@@ -385,9 +388,10 @@ func (h *NFSHandler) fromHandle(handle handle) (ret handleTarget, err error) {
 		return mkTargetFromPath(statusFile), nil
 	}
 
-	h.mu.Lock()
-	targ, ok := h.handle[handle]
-	h.mu.Unlock()
+	fs := h.fs
+	fs.mu.Lock()
+	targ, ok := fs.handle[handle]
+	fs.mu.Unlock()
 	if ok {
 		return targ, nil
 	}
@@ -398,9 +402,9 @@ func (h *NFSHandler) fromHandle(handle handle) (ret handleTarget, err error) {
 			if ret.path == "" || ret.segs == nil {
 				panic("shouldn't happen")
 			}
-			h.mu.Lock()
-			mak.Set(&h.handle, handle, ret)
-			h.mu.Unlock()
+			fs.mu.Lock()
+			mak.Set(&fs.handle, handle, ret)
+			fs.mu.Unlock()
 		}
 	}()
 
@@ -504,9 +508,8 @@ func (n *NFSHandler) OnNFSRead(ctx context.Context, handleb []byte, offset uint6
 	}
 
 	handle := handle(handleb)
-	end := offset + uint64(count)
 
-	contents, attr, err := n.getFileContents(ctx, handle, end)
+	contents, attr, err := n.getFileContents(ctx, handle)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, &nfs.NFSStatusError{
@@ -532,27 +535,21 @@ func (n *NFSHandler) OnNFSRead(ctx context.Context, handleb []byte, offset uint6
 	return res, nil
 }
 
-func (n *NFSHandler) filenameLocked(h handle) (string, bool) {
-	if h == statusHandle {
-		return statusFile, true
-	}
-	// TODO:
-	targ, ok := n.handle[h]
-	if !ok {
-		return "", false
-	}
-	return targ.path, true
-}
-
-func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint64) ([]byte, *nfs.FileAttribute, error) {
-	n.mu.Lock()
-	ent, ok := n.readCache[h]
+func (n *NFSHandler) getFileContents(ctx context.Context, h handle) ([]byte, *nfs.FileAttribute, error) {
+	fs := n.fs
+	fs.mu.Lock()
+	ent, ok := fs.entCache.GetOk(h)
 	if ok {
-		defer n.mu.Unlock()
-		ent.timer.Reset(10 * time.Second)
-		return ent.contents, ent.attr, nil
+		blob, ok := fs.blobCache.GetOk(ent.blobHash)
+		if ok {
+			fs.mu.Unlock()
+			fs.MetricFileContentCacheHit.Add(1)
+			return blob, ent.attr, nil
+		}
 	}
-	n.mu.Unlock()
+	fs.mu.Unlock()
+
+	fs.MetricFileContentCacheMiss.Add(1)
 
 	ht, err := n.fromHandle(h)
 	if err != nil {
@@ -569,40 +566,69 @@ func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint
 		return nil, nil, err
 	}
 
-	if uint64(len(contents)) <= readEnd || filename == statusFile {
-		// The caller probably won't be coming back for more reads.
-		// No need to cache it.
-		return contents, attr, nil
-	}
+	fs.MetricFileContentCacheFill.Add(1)
 
-	n.setReadCache(h, &readCacheEntry{
-		path:     filename,
-		contents: contents,
-		attr:     attr,
-	})
+	fs.setReadCache(h, attr, contents)
 	return contents, attr, err
 }
 
-func (n *NFSHandler) setReadCache(h handle, ent *readCacheEntry) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.readCache == nil {
-		n.readCache = map[handle]*readCacheEntry{}
+func (fs *FS) decrBlobCountLocked(h blobHash) {
+	v := fs.blobCount[h]
+	if v <= 0 {
+		panic("bogus decrement")
 	}
-	ent.timer = time.AfterFunc(10*time.Second, func() {
-		n.removeFileCache(h)
-	})
-	n.readCache[h] = ent
+	if v == 1 {
+		delete(fs.blobCount, h)
+		fs.blobCache.Delete(h)
+	} else {
+		fs.blobCount[h] = v - 1
+	}
 }
 
-func (n *NFSHandler) removeFileCache(h handle) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	_, ok := n.readCache[h]
-	if !ok {
-		return
+func (fs *FS) setReadCache(h handle, attr *nfs.FileAttribute, contents []byte) {
+	ent := &readCacheEntry{
+		attr:     attr,
+		blobHash: sha256.Sum256(contents),
 	}
-	delete(n.readCache, h)
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Initialize fs's blob-related caches on the first blob put.
+	// (The FS type doesn't have a constructor that does this.)
+	if fs.blobCount == nil {
+		fs.blobCount = make(map[blobHash]int)
+		fs.blobCache.EntrySize = func(key blobHash, value []byte) int64 {
+			return int64(len(value))
+		}
+	}
+
+	defer func() {
+		fs.MetricFileEntryCount.Set(int64(fs.entCache.Len()))
+		fs.MetricBlobEntryCount.Set(int64(len(fs.blobCount)))
+		fs.MetricBlobEntrySize.Set(int64(fs.blobCache.Size()))
+	}()
+
+	if was, ok := fs.entCache.PeekOk(h); ok {
+		fs.decrBlobCountLocked(was.blobHash)
+	}
+	fs.entCache.Set(h, ent)
+
+	fs.blobCount[ent.blobHash]++
+
+	fs.blobCache.Set(ent.blobHash, contents)
+
+	// If we're over our max size, keep looping deleting old entries until we
+	// remove enough blobs. Some entries (if they share a blob) won't end up
+	// deleting a blob and will only delete a entCache entry.
+	max := fs.GetFileCacheSize()
+	for fs.blobCache.Size() > max {
+		_, v, ok := fs.entCache.DeleteOldest()
+		if !ok {
+			break
+		}
+		fs.decrBlobCountLocked(v.blobHash)
+	}
 }
 
 func setNFSTime(attr *nfs.FileAttribute, t time.Time) {

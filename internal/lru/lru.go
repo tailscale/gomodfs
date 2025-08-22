@@ -20,9 +20,18 @@ import (
 // The current implementation is just the traditional LRU linked list; a future
 // implementation may be more advanced to avoid pathological cases.
 type Cache[K comparable, V any] struct {
-	// MaxEntries is the maximum number of cache entries before
+	// MaxSize is the maximum number of cache "size" units before
 	// an item is evicted. Zero means no limit.
-	MaxEntries int
+	//
+	// By default, the size of an entry is 1, unless EntrySize is set.
+	MaxSize int64
+
+	// EntrySize returns the size of a single cache entry. This is used to
+	// calculate the total size of the cache and enforce the MaxSize limit.
+	// If nil, the size of an entry is 1.
+	EntrySize func(key K, value V) int64
+
+	curSize int64
 
 	// head is a ring of LRU values. head points to the most recently
 	// used element, head.prev is the least recently used.
@@ -47,6 +56,13 @@ type entry[K comparable, V any] struct {
 	value      V
 }
 
+func (c *Cache[K, V]) entrySize(key K, value V) int64 {
+	if c.EntrySize == nil {
+		return 1
+	}
+	return c.EntrySize(key, value)
+}
+
 // Set adds or replaces a value to the cache, set or updating its associated
 // value.
 //
@@ -58,12 +74,14 @@ func (c *Cache[K, V]) Set(key K, value V) {
 	}
 	if ent, ok := c.lookup[key]; ok {
 		c.moveToFront(ent)
+		c.curSize -= c.entrySize(key, ent.value)
 		ent.value = value
-		return
+	} else {
+		ent := c.newAtFront(key, value)
+		c.lookup[key] = ent
 	}
-	ent := c.newAtFront(key, value)
-	c.lookup[key] = ent
-	if c.MaxEntries != 0 && c.Len() > c.MaxEntries {
+	c.curSize += c.entrySize(key, value)
+	for c.MaxSize != 0 && c.curSize > c.MaxSize {
 		c.deleteOldest()
 	}
 }
@@ -72,6 +90,7 @@ func (c *Cache[K, V]) Set(key K, value V) {
 func (c *Cache[K, V]) Clear() {
 	c.head = nil
 	c.lookup = nil
+	c.curSize = 0
 }
 
 // Get looks up a key's value from the cache, returning either
@@ -136,6 +155,10 @@ func (c *Cache[K, V]) DeleteOldest() {
 // Len returns the number of items in the cache.
 func (c *Cache[K, V]) Len() int { return len(c.lookup) }
 
+// Size returns the "size" of the cache, as defined by the Cache EntrySize
+// function.
+func (c *Cache[K, V]) Size() int64 { return c.curSize }
+
 // newAtFront creates a new LRU entry using key and value, and inserts
 // it at the front of c.head.
 func (c *Cache[K, V]) newAtFront(key K, value V) *entry[K, V] {
@@ -185,6 +208,7 @@ func (c *Cache[K, V]) deleteElement(ent *entry[K, V]) {
 		}
 	}
 	delete(c.lookup, ent.key)
+	c.curSize -= c.entrySize(ent.key, ent.value)
 }
 
 // ForEach calls fn for each entry in the cache, from most recently

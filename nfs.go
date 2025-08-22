@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"expvar"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/tailscale/gomodfs/internal/lru"
 	"github.com/tailscale/gomodfs/store"
 	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
 	"tailscale.com/util/mak"
@@ -27,7 +30,14 @@ import (
 
 func (fs *FS) NFSHandler() nfs.Handler {
 	// Create a new NFS handler that uses the gomodfs file system.
-	return &NFSHandler{fs: fs}
+	h := &NFSHandler{
+		fs:        fs,
+		blobCount: make(map[blobHash]int),
+	}
+	h.blobCache.EntrySize = func(key blobHash, value []byte) int64 {
+		return int64(len(value))
+	}
+	return h
 }
 
 // handle is the NFSv3 handle godmodfs uses. It's 64 bytes, so it's necessarily
@@ -49,14 +59,40 @@ var zeroHandle handle
 var statusHandle = handle{0: 'S', 1: 'T', 2: 'A', 3: 'T', 4: 'U', 5: 'S'}
 
 type NFSHandler struct {
-	fs *FS
-
+	fs          *FS
 	nfs.Handler // temporary embedding during dev to watch what panics
 
-	mu          sync.Mutex
-	handle      map[handle]handleTarget
-	readCache   map[handle]*readCacheEntry
+	metricFileContentCacheHit  expvar.Int
+	metricFileContentCacheMiss expvar.Int
+	metricFileContentCacheFill expvar.Int
+
+	mu sync.Mutex // protects all the following fields
+
 	statusCache *statusMeta
+
+	// handle maps from an NFS handle to the path it corresponds to.
+	//
+	// TODO(bradfitz): LRU-ify this. this was once load bearing but it's now a
+	// cache now that all handles can map back to a handleTarget anyway
+	handle map[handle]handleTarget
+
+	entCache  lru.Cache[handle, *readCacheEntry]
+	blobCache lru.Cache[blobHash, []byte]
+	blobCount map[blobHash]int // ref count of blobHash in entCache
+}
+
+func (n *NFSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// TODO(bradfitz): add a proper Prometheus handler. These are temporary as
+	// of 2025-08-22 while tuning and deciding what metrics we actually want.
+
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "handles = %v\n", len(n.handle))
+	fmt.Fprintf(w, "entCache = %v\n", n.entCache.Len())
+	fmt.Fprintf(w, "blobCache = %v ents, %v size\n", n.blobCache.Len(), n.blobCache.Size())
+	fmt.Fprintf(w, "blobCount = %v\n", len(n.blobCount))
 }
 
 type handleTarget struct {
@@ -93,12 +129,17 @@ func (h *NFSHandler) statusFile() *statusMeta {
 	return h.statusCache
 }
 
-type readCacheEntry struct {
+type readCacheEntryOld struct {
 	contents []byte
-	path     string
 	attr     *nfs.FileAttribute
-	timer    *time.Timer // for the AfterFunc to remove it from the cache
 }
+
+type readCacheEntry struct {
+	attr     *nfs.FileAttribute
+	blobHash blobHash
+}
+
+type blobHash [sha256.Size]byte
 
 var (
 	_ nfs.Handler     = (*NFSHandler)(nil)
@@ -202,6 +243,12 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 }
 
 func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
+	// TODO(bradfitz): if the NFS layer passed in the NFS handle here (like if
+	// we bypassed BillyFS and added a lower level NFS path like we did for
+	// OnNFSRead), then we could check the NFS handle read cache and get its
+	// attributes directy, without the hop through parsing the path and looking
+	// up the ModHandle and then checking the git storage maps.
+
 	mp := parsePath(filename)
 	if mp.NotExist {
 		return nil, os.ErrNotExist
@@ -546,13 +593,18 @@ func (n *NFSHandler) filenameLocked(h handle) (string, bool) {
 
 func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint64) ([]byte, *nfs.FileAttribute, error) {
 	n.mu.Lock()
-	ent, ok := n.readCache[h]
+	ent, ok := n.entCache.GetOk(h)
 	if ok {
-		defer n.mu.Unlock()
-		ent.timer.Reset(10 * time.Second)
-		return ent.contents, ent.attr, nil
+		blob, ok := n.blobCache.GetOk(ent.blobHash)
+		if ok {
+			n.mu.Unlock()
+			n.metricFileContentCacheHit.Add(1)
+			return blob, ent.attr, nil
+		}
 	}
 	n.mu.Unlock()
+
+	n.metricFileContentCacheMiss.Add(1)
 
 	ht, err := n.fromHandle(h)
 	if err != nil {
@@ -569,40 +621,55 @@ func (n *NFSHandler) getFileContents(ctx context.Context, h handle, readEnd uint
 		return nil, nil, err
 	}
 
-	if uint64(len(contents)) <= readEnd || filename == statusFile {
-		// The caller probably won't be coming back for more reads.
-		// No need to cache it.
-		return contents, attr, nil
-	}
+	n.metricFileContentCacheFill.Add(1)
 
-	n.setReadCache(h, &readCacheEntry{
-		path:     filename,
-		contents: contents,
-		attr:     attr,
-	})
+	n.setReadCache(h, attr, contents)
 	return contents, attr, err
 }
 
-func (n *NFSHandler) setReadCache(h handle, ent *readCacheEntry) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.readCache == nil {
-		n.readCache = map[handle]*readCacheEntry{}
+func (n *NFSHandler) decrBlobCountLocked(h blobHash) {
+	v := n.blobCount[h]
+	if v <= 0 {
+		panic("bogus decrement")
 	}
-	ent.timer = time.AfterFunc(10*time.Second, func() {
-		n.removeFileCache(h)
-	})
-	n.readCache[h] = ent
+	if v == 1 {
+		delete(n.blobCount, h)
+		n.blobCache.Delete(h)
+	} else {
+		n.blobCount[h] = v - 1
+	}
 }
 
-func (n *NFSHandler) removeFileCache(h handle) {
+func (n *NFSHandler) setReadCache(h handle, attr *nfs.FileAttribute, contents []byte) {
+	blobHash := sha256.Sum256(contents)
+
+	ent := &readCacheEntry{
+		attr:     attr,
+		blobHash: blobHash,
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	_, ok := n.readCache[h]
-	if !ok {
-		return
+
+	if was, ok := n.entCache.PeekOk(h); ok {
+		n.decrBlobCountLocked(was.blobHash)
 	}
-	delete(n.readCache, h)
+	n.entCache.Set(h, ent)
+	n.blobCount[ent.blobHash]++
+
+	n.blobCache.Set(ent.blobHash, contents)
+
+	// If we're over our max size, keep looping deleting old entries until we
+	// remove enough blobs. Some entries (if they share a blob) won't end up
+	// deleting a blob and will only delete a entCache entry.
+	max := n.fs.GetFileCacheSize()
+	for n.blobCache.Size() > max {
+		_, v, ok := n.entCache.DeleteOldest()
+		if !ok {
+			break
+		}
+		n.decrBlobCountLocked(v.blobHash)
+	}
 }
 
 func setNFSTime(attr *nfs.FileAttribute, t time.Time) {

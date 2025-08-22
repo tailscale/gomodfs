@@ -65,10 +65,19 @@ type FS struct {
 
 	Verbose bool
 
+	// FileCacheSize specifies the file cache size to use.
+	// If zero, a default size is used.
+	FileCacheSize int64
+
 	mu             sync.RWMutex
 	zipRootCache   map[store.ModuleVersion]modHandleCacheEntry
 	modVerHash     map[modVerHash]store.ModuleVersion // nil until first used
 	pathHashTarget map[pathHash]handleTarget          // nil until first used
+}
+
+func (fs *FS) GetFileCacheSize() int64 {
+	const defaultFileCacheSize = 2 << 30
+	return cmp.Or(fs.FileCacheSize, defaultFileCacheSize)
 }
 
 func hashModVersion(mv store.ModuleVersion) (ret modVerHash) {
@@ -517,6 +526,8 @@ func (fs *FS) initHandleMapsLocked() error {
 	return nil
 }
 
+// handleTargetWithPathHash maps from a NFS path hash
+//
 // should return [staleErr] on non-I/O-error-related miss.
 func (fs *FS) handleTargetWithPathHash(ph pathHash) (handleTarget, error) {
 	var zero handleTarget

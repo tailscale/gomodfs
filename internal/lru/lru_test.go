@@ -6,6 +6,7 @@ package lru
 import (
 	"bytes"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -30,7 +31,7 @@ func TestLRU(t *testing.T) {
 	if g, w := c.Len(), 1; g != w {
 		t.Errorf("Len = %d; want %d", g, w)
 	}
-	c.MaxEntries = 2
+	c.MaxSize = 2
 	c.Set(1, "one")
 	c.Set(2, "two")
 	c.Set(3, "three")
@@ -50,6 +51,81 @@ func TestLRU(t *testing.T) {
 	c.Clear()
 	if g, w := c.Len(), 0; g != w {
 		t.Errorf("Len = %d; want %d", g, w)
+	}
+}
+
+func TestEntrySize(t *testing.T) {
+	var c Cache[int, string]
+	c.MaxSize = 10
+	c.EntrySize = func(key int, value string) int64 {
+		return int64(len(value))
+	}
+
+	steps := []struct {
+		key      int
+		val      string
+		wantSize int64
+		wantLen  int
+		want     map[int]string
+	}{
+		{
+			key:      1,
+			val:      "a",
+			wantSize: 1,
+			wantLen:  1,
+			want:     map[int]string{1: "a"},
+		},
+		{
+			key:      2,
+			val:      "bb",
+			wantSize: 3,
+			wantLen:  2,
+			want:     map[int]string{1: "a", 2: "bb"},
+		},
+		{
+			key:      3,
+			val:      "ccc",
+			wantSize: 6,
+			wantLen:  3,
+			want:     map[int]string{1: "a", 2: "bb", 3: "ccc"},
+		},
+		{
+			key:      4,
+			val:      "dddd",
+			wantSize: 10,
+			wantLen:  4,
+			want:     map[int]string{1: "a", 2: "bb", 3: "ccc", 4: "dddd"},
+		},
+		{
+			key:      5,
+			val:      "eee",
+			wantSize: 10,
+			wantLen:  3,
+			want:     map[int]string{3: "ccc", 4: "dddd", 5: "eee"},
+		},
+		{
+			key:      5,
+			val:      "eeee", // make it one bigger
+			wantSize: 8,
+			wantLen:  2,
+			want:     map[int]string{4: "dddd", 5: "eeee"},
+		},
+	}
+	for i, st := range steps {
+		c.Set(st.key, st.val)
+		if c.Len() != st.wantLen {
+			t.Fatalf("step[%d]: Len = %d; want %d", i, c.Len(), st.wantLen)
+		}
+		if c.Size() != st.wantSize {
+			t.Fatalf("step[%d]: Size = %d; want %d", i, c.Size(), st.wantSize)
+		}
+		got := map[int]string{}
+		c.ForEach(func(key int, val string) {
+			got[key] = val
+		})
+		if !reflect.DeepEqual(got, st.want) {
+			t.Fatalf("step[%d]: got = %v; want %v", i, got, st.want)
+		}
 	}
 }
 
@@ -78,7 +154,7 @@ func TestStressEvictions(t *testing.T) {
 	vals := slicesx.MapKeys(vm)
 
 	c := Cache[uint64, bool]{
-		MaxEntries: cacheSize,
+		MaxSize: cacheSize,
 	}
 
 	for range numProbes {
@@ -204,7 +280,7 @@ func (c *Cache[K, V]) prevLen(t testing.TB, limit int) (n int) {
 }
 
 func TestDumpHTML(t *testing.T) {
-	c := Cache[int, string]{MaxEntries: 3}
+	c := Cache[int, string]{MaxSize: 3}
 
 	c.Set(1, "foo")
 	c.Set(2, "bar")
@@ -232,7 +308,7 @@ func BenchmarkLRU(b *testing.B) {
 	const lruSize = 10
 	const maxval = 15 // 33% more keys than the LRU can hold
 
-	c := Cache[int, bool]{MaxEntries: lruSize}
+	c := Cache[int, bool]{MaxSize: lruSize}
 	b.ReportAllocs()
 	for range b.N {
 		k := rand.Intn(maxval)

@@ -16,6 +16,9 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tailscale/gomodfs"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
@@ -28,6 +31,7 @@ var (
 	useWebDAV      = flag.Bool("webdav", false, "use WebDAV instead of FUSE (useful on macOS w/o kernel extensions allowed)")
 	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
 	flagMountPoint = flag.String("mount", filepath.Join(os.Getenv("HOME"), "mnt-gomodfs"), "if set, mount the filesystem at this path")
+	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
 )
 
 func main() {
@@ -52,7 +56,33 @@ func main() {
 		}
 	}
 
-	st := &stats.Stats{}
+	metricOpStarted := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_started",
+			Help: "Total number of operations started by gomodfs.",
+		},
+		[]string{"op"},
+	)
+	metricOpEnded := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_ended",
+			Help: "Total number of operations ended by gomodfs.",
+		},
+		[]string{"op"},
+	)
+	metricOpDuration := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_duration_seconds_total",
+			Help: "Total duration of operations performed by gomodfs in seconds.",
+		},
+		[]string{"op"},
+	)
+
+	st := &stats.Stats{
+		MetricOpStarted:  metricOpStarted,
+		MetricOpEnded:    metricOpEnded,
+		MetricOpDuration: metricOpDuration,
+	}
 	gitStore := &gitstore.Storage{
 		GitRepo: gitCache,
 		Stats:   st,
@@ -62,6 +92,11 @@ func main() {
 		Stats:   st,
 		Verbose: *verbose,
 	}
+	if *flagMemLimitMB != 0 {
+		mfs.FileCacheSize = *flagMemLimitMB << 20
+	}
+
+	nfsHandler := mfs.NFSHandler()
 
 	if *debugListen != "" {
 		ln, err := net.Listen("tcp", *debugListen)
@@ -69,8 +104,30 @@ func main() {
 			log.Fatalf("Failed to listen on %s: %v", *debugListen, err)
 		}
 		log.Printf("Debug HTTP server listening on %s", *debugListen)
+
+		reg := prometheus.NewRegistry()
+		reg.MustRegister(
+			collectors.NewGoCollector(),
+			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+			collectors.NewBuildInfoCollector(),
+		)
+		mfs.RegisterMetrics(reg)
+		reg.MustRegister(metricOpStarted)
+		reg.MustRegister(metricOpEnded)
+		reg.MustRegister(metricOpDuration)
+
+		metricsHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+			ErrorLog: log.Default(),
+		})
+
 		hs := &http.Server{
-			Handler: mfs,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.RequestURI == "/metrics" {
+					metricsHandler.ServeHTTP(w, r)
+				} else {
+					mfs.ServeHTTP(w, r)
+				}
+			}),
 		}
 		go hs.Serve(ln)
 	}
@@ -88,9 +145,9 @@ func main() {
 		log.Printf("NFS server listening at %s", nfsListenAddr)
 		if runtime.GOOS == "darwin" && mntDir == "" {
 			port := ln.Addr().(*net.TCPAddr).Port
-			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
+			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d,vers=3,tcp,locallocks,soft -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
-		go nfs.Serve(ln, mfs.NFSHandler())
+		go nfs.Serve(ln, nfsHandler)
 	}
 
 	if mntDir == "" {

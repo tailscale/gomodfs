@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"iter"
@@ -34,6 +35,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/tailscale/gomodfs/internal/lru"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
 	"golang.org/x/mod/module"
@@ -65,10 +67,40 @@ type FS struct {
 
 	Verbose bool
 
+	// FileCacheSize specifies the file cache size to use.
+	// If zero, a default size is used.
+	FileCacheSize int64
+
+	// Metrics for Prometheus:
+
+	MetricFileContentCacheHit  expvar.Int `type:"counter" name:"file_content_cache_hit" help:"number of file content cache hits"`
+	MetricFileContentCacheMiss expvar.Int `type:"counter" name:"file_content_cache_miss" help:"number of file content cache misses"`
+	MetricFileContentCacheFill expvar.Int `type:"counter" name:"file_content_cache_fill" help:"number of file content cache fills"`
+	MetricFileEntryCount       expvar.Int `type:"gauge" name:"file_content_entry_count" help:"current number of file entries in the file content cache"`
+	MetricBlobEntryCount       expvar.Int `type:"gauge" name:"blob_entry_count" help:"current number of blob entries in the blob cache"`
+	MetricBlobEntrySize        expvar.Int `type:"gauge" name:"blob_entry_size" help:"current total size of all blob entries in the blob cache"`
+
 	mu             sync.RWMutex
 	zipRootCache   map[store.ModuleVersion]modHandleCacheEntry
 	modVerHash     map[modVerHash]store.ModuleVersion // nil until first used
 	pathHashTarget map[pathHash]handleTarget          // nil until first used
+
+	statusCache *statusMeta
+
+	// handle maps from an NFS handle to the path it corresponds to.
+	//
+	// TODO(bradfitz): LRU-ify this. this was once load bearing but it's now a
+	// cache now that all handles can map back to a handleTarget anyway
+	handle map[handle]handleTarget
+
+	entCache  lru.Cache[handle, *readCacheEntry]
+	blobCache lru.Cache[blobHash, []byte]
+	blobCount map[blobHash]int // ref count of blobHash in entCache
+}
+
+func (fs *FS) GetFileCacheSize() int64 {
+	const defaultFileCacheSize = 2 << 30
+	return cmp.Or(fs.FileCacheSize, defaultFileCacheSize)
 }
 
 func hashModVersion(mv store.ModuleVersion) (ret modVerHash) {
@@ -517,6 +549,8 @@ func (fs *FS) initHandleMapsLocked() error {
 	return nil
 }
 
+// handleTargetWithPathHash maps from a NFS path hash
+//
 // should return [staleErr] on non-I/O-error-related miss.
 func (fs *FS) handleTargetWithPathHash(ph pathHash) (handleTarget, error) {
 	var zero handleTarget

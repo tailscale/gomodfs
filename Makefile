@@ -14,3 +14,13 @@ benchmark:
 	time go install tailscale.com/cmd/tailscaled; \
 	time go install tailscale.com/cmd/tailscaled; \
 	time go install tailscale.com/cmd/tailscaled
+
+benchcorp:
+	@set -eu; \
+	rm -rf /tmp/buildcache-gomodfs; \
+	mkdir -p /tmp/buildcache-gomodfs; \
+	export GOCACHE=/tmp/buildcache-gomodfs; \
+	export GOMODCACHE="$${HOME}/mnt-gomodfs"; \
+	cd "$${HOME}/src/tailscale.io"; \
+	echo "corp test build..."; \
+	time go test -exec=true tailscale.io/...; \

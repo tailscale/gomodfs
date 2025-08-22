@@ -17,6 +17,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // OpStat holds statistics for a single operation type.
@@ -34,6 +36,10 @@ type OpStat struct {
 //
 // If nil, no statistics are collected.
 type Stats struct {
+	MetricOpStarted  *prometheus.CounterVec // used if non-nil
+	MetricOpEnded    *prometheus.CounterVec // used if non-nil
+	MetricOpDuration *prometheus.CounterVec // used if non-nil
+
 	mu  sync.Mutex
 	ops map[string]*OpStat
 }
@@ -91,6 +97,9 @@ func (st *Stats) StartSpan(op string) *ActiveSpan {
 		}
 		as.os = os
 		os.Started++
+		if st.MetricOpStarted != nil {
+			st.MetricOpStarted.WithLabelValues(op).Inc()
+		}
 	}
 	return as
 }
@@ -108,6 +117,15 @@ func (s *ActiveSpan) End(err error) {
 	if ost == nil {
 		return
 	}
+
+	duration := time.Since(s.start)
+	if st.MetricOpEnded != nil {
+		st.MetricOpEnded.WithLabelValues(s.op).Inc()
+	}
+	if st.MetricOpDuration != nil {
+		st.MetricOpDuration.WithLabelValues(s.op).Add(duration.Seconds())
+	}
+
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -124,8 +142,7 @@ func (s *ActiveSpan) End(err error) {
 			}
 		}
 	}
-	d := time.Since(s.start)
-	ost.TotalDur += d
+	ost.TotalDur += duration
 }
 
 func (st *Stats) ServeHTTP(w http.ResponseWriter, r *http.Request) {

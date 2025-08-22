@@ -63,7 +63,7 @@ func (c *Cache[K, V]) entrySize(key K, value V) int64 {
 	return c.EntrySize(key, value)
 }
 
-// Set adds or replaces a value to the cache, set or updating its associated
+// Set adds or replaces a value to the cache, setting or updating its associated
 // value.
 //
 // If MaxEntries is non-zero and the length of the cache is greater
@@ -145,11 +145,17 @@ func (c *Cache[K, V]) Delete(key K) {
 }
 
 // DeleteOldest removes the item from the cache that was least
-// recently accessed. It is a no-op if the cache is empty.
-func (c *Cache[K, V]) DeleteOldest() {
-	if c.head != nil {
-		c.deleteOldest()
+// recently accessed.
+//
+// It returns the deleted item, if any.
+func (c *Cache[K, V]) DeleteOldest() (key K, val V, ok bool) {
+	if c.head == nil {
+		return
 	}
+	ent := c.head.prev
+	key, val = ent.key, ent.value
+	c.deleteOldest()
+	return key, val, true
 }
 
 // Len returns the number of items in the cache.

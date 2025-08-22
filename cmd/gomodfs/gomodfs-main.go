@@ -63,6 +63,8 @@ func main() {
 		Verbose: *verbose,
 	}
 
+	nfsHandler := mfs.NFSHandler()
+
 	if *debugListen != "" {
 		ln, err := net.Listen("tcp", *debugListen)
 		if err != nil {
@@ -70,7 +72,13 @@ func main() {
 		}
 		log.Printf("Debug HTTP server listening on %s", *debugListen)
 		hs := &http.Server{
-			Handler: mfs,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.RequestURI == "/nfs" {
+					nfsHandler.(*gomodfs.NFSHandler).ServeHTTP(w, r)
+				} else {
+					mfs.ServeHTTP(w, r)
+				}
+			}),
 		}
 		go hs.Serve(ln)
 	}
@@ -90,7 +98,7 @@ func main() {
 			port := ln.Addr().(*net.TCPAddr).Port
 			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
-		go nfs.Serve(ln, mfs.NFSHandler())
+		go nfs.Serve(ln, nfsHandler)
 	}
 
 	if mntDir == "" {

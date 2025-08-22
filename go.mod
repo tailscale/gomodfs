@@ -7,6 +7,7 @@ toolchain go1.24.6
 require (
 	github.com/go-git/go-billy/v5 v5.6.2
 	github.com/go-git/go-git/v5 v5.16.2
+	github.com/google/go-cmp v0.7.0
 	github.com/hanwen/go-fuse/v2 v2.8.0
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
 	github.com/willscott/go-nfs v0.0.3
@@ -30,6 +31,7 @@ require (
 	github.com/pjbgf/sha1cd v0.4.0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	golang.org/x/crypto v0.40.0 // indirect
+	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )

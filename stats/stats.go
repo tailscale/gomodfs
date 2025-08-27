@@ -44,6 +44,37 @@ type Stats struct {
 	ops map[string]*OpStat
 }
 
+// NewStatsWithRegstry returns a new Stats instance with metrics initialized and
+// registered to the provided registry.
+func NewStatsWithRegistry(reg *prometheus.Registry) *Stats {
+	s := &Stats{}
+	s.MetricOpStarted = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_started",
+			Help: "Total number of operations started by gomodfs.",
+		},
+		[]string{"op"},
+	)
+	s.MetricOpEnded = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_ended",
+			Help: "Total number of operations ended by gomodfs.",
+		},
+		[]string{"op"},
+	)
+	s.MetricOpDuration = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gomodfs_operation_duration_seconds_total",
+			Help: "Total duration of operations performed by gomodfs in seconds.",
+		},
+		[]string{"op"},
+	)
+	reg.MustRegister(s.MetricOpStarted)
+	reg.MustRegister(s.MetricOpEnded)
+	reg.MustRegister(s.MetricOpDuration)
+	return s
+}
+
 // Clone returns a clone of the current operation statistics,
 // keyed by operation name.
 //

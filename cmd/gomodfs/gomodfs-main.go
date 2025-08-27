@@ -55,34 +55,13 @@ func main() {
 			log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
 		}
 	}
-
-	metricOpStarted := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gomodfs_operation_started",
-			Help: "Total number of operations started by gomodfs.",
-		},
-		[]string{"op"},
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewBuildInfoCollector(),
 	)
-	metricOpEnded := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gomodfs_operation_ended",
-			Help: "Total number of operations ended by gomodfs.",
-		},
-		[]string{"op"},
-	)
-	metricOpDuration := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gomodfs_operation_duration_seconds_total",
-			Help: "Total duration of operations performed by gomodfs in seconds.",
-		},
-		[]string{"op"},
-	)
-
-	st := &stats.Stats{
-		MetricOpStarted:  metricOpStarted,
-		MetricOpEnded:    metricOpEnded,
-		MetricOpDuration: metricOpDuration,
-	}
+	st := stats.NewStatsWithRegistry(reg)
 	gitStore := &gitstore.Storage{
 		GitRepo: gitCache,
 		Stats:   st,
@@ -105,16 +84,7 @@ func main() {
 		}
 		log.Printf("Debug HTTP server listening on %s", *debugListen)
 
-		reg := prometheus.NewRegistry()
-		reg.MustRegister(
-			collectors.NewGoCollector(),
-			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-			collectors.NewBuildInfoCollector(),
-		)
 		mfs.RegisterMetrics(reg)
-		reg.MustRegister(metricOpStarted)
-		reg.MustRegister(metricOpEnded)
-		reg.MustRegister(metricOpDuration)
 
 		metricsHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 			ErrorLog: log.Default(),

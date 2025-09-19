@@ -1308,13 +1308,7 @@ func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
 	return mt, nil
 }
 
-func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr, opt *MountOpts) error {
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("gomodfs: NFS mount is currently only supported on macOS")
-	}
-	if opt == nil {
-		opt = &MountOpts{}
-	}
+func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr) error {
 	port := nfsAddr.(*net.TCPAddr).Port
 	ip, ok := netip.AddrFromSlice(nfsAddr.(*net.TCPAddr).IP)
 	if !ok {
@@ -1323,14 +1317,20 @@ func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr, opt *MountOpts) error {
 	if ip.IsUnspecified() || ip.IsLoopback() {
 		ip = netip.MustParseAddr("127.0.0.1")
 	}
-	cmd := exec.Command("/sbin/mount",
+	var mountBin, mountOpts string
+	switch runtime.GOOS {
+	case "darwin":
+		mountBin = "/sbin/mount"
+		mountOpts = darwinNFSMountOpts(port)
+	case "linux":
+		mountBin = "/usr/bin/mount"
+		mountOpts = linuxNFSMountOpts(port)
+	default:
+		return fmt.Errorf("gomodfs: unsupported OS %q; NFS mount is currently only supported on linux and darwin", runtime.GOOS)
+	}
+	cmd := exec.Command(mountBin,
 		"-t", "nfs",
-		"-r", // read-only
-		"-o", fmt.Sprintf("port=%d,mountport=%d", port, port),
-		"-o", "vers=3",
-		"-o", "tcp",
-		"-o", "locallocks", // required to pacify cmd/go file locking
-		"-o", "soft", // maybe avoid GUI popups during dev?
+		"-o", mountOpts,
 		fmt.Sprintf("%s:/", ip),
 		mntDir,
 	)
@@ -1339,6 +1339,50 @@ func (fs *FS) MountNFS(mntDir string, nfsAddr net.Addr, opt *MountOpts) error {
 		return fmt.Errorf("gomodfs: failed to run mount command: %w; output: %s", err, out)
 	}
 	return nil
+}
+
+// https://linux.die.net/man/5/nfs
+func linuxNFSMountOpts(nfsPort int) string {
+	opts := []string{
+		// port is port at which NFS service should be available
+		// https://datatracker.ietf.org/doc/html/rfc1813#section-3.
+		"port=" + fmt.Sprint(nfsPort),
+		// mountport is port at which the mount RPC service should be available
+		// https://datatracker.ietf.org/doc/html/rfc1813#section-5.2.
+		"mountport=" + fmt.Sprint(nfsPort),
+		// version is NFS version. go-nfs implements NFSv3.
+		"vers=3",
+		"tcp",
+		"local_lock=all", // required to pacify cmd/go file locking
+		// timeout for NFS operations in deciseconds.
+		// 1800 = 3 minutes.
+		"timeo=1800",
+		// Create a readonly volume.
+		"ro",
+	}
+	return strings.Join(opts, ",")
+}
+
+// https://linux.die.net/man/5/nfs
+func darwinNFSMountOpts(nfsPort int) string {
+	opts := []string{
+		// port is port at which NFS service should be available
+		// https://datatracker.ietf.org/doc/html/rfc1813#section-3.
+		"port=" + fmt.Sprint(nfsPort),
+		// mountport is port at which the mount RPC service should be available
+		// https://datatracker.ietf.org/doc/html/rfc1813#section-5.2.
+		"mountport=" + fmt.Sprint(nfsPort),
+		// version is NFS version. go-nfs implements NFSv3.
+		"vers=3",
+		"tcp",
+		"locallocks", // required to pacify cmd/go file locking
+		// timeout for NFS operations in deciseconds.
+		// 1800 = 3 minutes.
+		"timeo=1800",
+		// Create a readonly volume.
+		"rdonly",
+	}
+	return strings.Join(opts, ",")
 }
 
 type webdavMount struct {

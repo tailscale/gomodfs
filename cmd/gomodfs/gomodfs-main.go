@@ -132,9 +132,7 @@ func main() {
 			Debug: *verbose,
 		})
 	} else if *flagNFS != "" {
-		err = mfs.MountNFS(mntDir, nfsListenAddr, &gomodfs.MountOpts{
-			Debug: *verbose,
-		})
+		err = mfs.MountNFS(mntDir, nfsListenAddr)
 	} else {
 		mount, err = mfs.MountFUSE(mntDir, &gomodfs.MountOpts{
 			Debug: *verbose,

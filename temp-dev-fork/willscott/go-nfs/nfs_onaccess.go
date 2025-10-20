@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"log"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -10,10 +11,15 @@ import (
 
 func onAccess(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = opAttrErrorFormatter
-	roothandle, err := xdr.ReadOpaque(w.req.Body)
+	roothandle, err := ReadOpaque(w.req.Body)
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
+	log.Printf("HANDLE: %x (onaccess)", roothandle)
+	// roothandle, err := xdr.ReadOpaque(w.req.Body)
+	// if err != nil {
+	// 	return &NFSStatusError{NFSStatusInval, err}
+	// }
 	fs, path, err := userHandle.FromHandle(roothandle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}

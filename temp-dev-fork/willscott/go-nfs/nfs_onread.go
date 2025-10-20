@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"os"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -37,6 +38,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
+	log.Printf("ONREAD: handle length %d handle: %x", len(obj.Handle), obj.Handle)
 
 	resp := nfsReadResponse{}
 
@@ -44,6 +46,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		nres, err := rh.OnNFSRead(ctx, obj.Handle, obj.Offset, obj.Count)
 		if err != nil {
 			if _, ok := err.(*NFSStatusError); ok {
+				log.Printf("NFS on read returning with error %v", err)
 				return err
 			}
 			return &NFSStatusError{NFSStatusServerFault, err}

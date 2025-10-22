@@ -13,7 +13,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
 	github.com/willscott/go-nfs v0.0.3
-	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
+	github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/mod v0.26.0
 	golang.org/x/net v0.42.0

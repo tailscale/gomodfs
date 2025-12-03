@@ -70,8 +70,9 @@ func (d *Storage) CheckExists() error {
 var errMissing = errors.New("gitstore: missing object")
 
 type objRequest struct {
-	rev string           // a git ref or hash
-	res chan objResponse // 1-buffered
+	rev  string           // a git ref or hash
+	stop bool             // whether this is a stop command
+	res  chan objResponse // 1-buffered
 }
 
 type objResponse struct {
@@ -110,6 +111,11 @@ func (d *Storage) getObject(ctx context.Context, rev, wantType string) (object, 
 func (d *Storage) startRequest(req objRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if req.stop && !d.catFileBatchRunning {
+		req.res <- objResponse{}
+		return
+	}
 
 	if d.wake == nil {
 		d.wake = make(chan bool, 1)
@@ -163,6 +169,13 @@ func (d *Storage) runCatFileBatch() (err error) {
 		return fmt.Errorf("error starting cat-file batch: %w", err)
 	}
 
+	var shutdownFunc func()
+	defer func() {
+		if shutdownFunc != nil {
+			shutdownFunc()
+		}
+	}()
+
 	defer cmd.Process.Wait()
 	defer stdin.Close()
 
@@ -170,6 +183,14 @@ func (d *Storage) runCatFileBatch() (err error) {
 	for {
 		req, ok := d.takePendingRequest(10 * time.Second)
 		if !ok {
+			return nil
+		}
+		if req.stop {
+			// Send on this channel only after the process has exited
+			// in the defer cmd.Process.Wait above.
+			shutdownFunc = func() {
+				req.res <- objResponse{}
+			}
 			return nil
 		}
 		sp := d.Stats.StartSpan("gitstore.cat-file-batch.request")
@@ -227,6 +248,18 @@ func (d *Storage) runCatFileBatch() (err error) {
 		default:
 			panic("unexpected cat-file batch response channel full")
 		}
+	}
+}
+
+// StopGitHelperProcess stops the git helper process, if any.
+func (d *Storage) StopGitHelperProcess() error {
+	ch := make(chan objResponse, 1)
+	d.startRequest(objRequest{stop: true, res: ch})
+	select {
+	case <-ch:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout waiting for git helper process to stop")
 	}
 }
 

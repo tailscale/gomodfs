@@ -12,9 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tailscale/gomodfs/store/gitstore"
 )
@@ -119,6 +121,25 @@ func pathAndParentPaths(s string) iter.Seq[string] {
 func testGitDir(t testing.TB) string {
 	t.Helper()
 	gitDir := t.TempDir()
+
+	if runtime.GOOS == "windows" {
+		t.Cleanup(func() {
+			// We only care if the test failed or if we suspect cleanup might fail
+			// Note: We can't easily predict if RemoveAll will fail here,
+			// but we can try to anticipate it or just log open handles for the directory.
+
+			// This command lists all handles open for the specific directory
+			// -a: Dump all info
+			// -u: Show user
+			// -nobanner: cleaner output
+			cmd := exec.Command("handle.exe", "-a", "-u", "-nobanner", gitDir)
+			out, err := cmd.CombinedOutput()
+			if err == nil && len(out) > 0 {
+				t.Logf("DEBUG: Open handles for %s:\n%s", gitDir, out)
+			}
+		})
+	}
+
 	cmd := exec.Command("git", "init")
 	cmd.Dir = gitDir
 	if err := cmd.Run(); err != nil {
@@ -130,6 +151,24 @@ func testGitDir(t testing.TB) string {
 func testNFSHandler(t testing.TB, gitCacheDir string) *NFSHandler {
 	t.Helper()
 	store := &gitstore.Storage{GitRepo: gitCacheDir}
+	t.Cleanup(func() {
+		err := store.StopGitHelperProcess()
+		t.Logf("gitstore(%p): StopGitHelperProcess returned: %v", store, err)
+
+		// On Windows, empirically we have to wait for up to a second for
+		// the os.Process (despite Wait returning success) to fully release
+		// its file handles. Sigh.
+		if runtime.GOOS == "windows" {
+			const sleepDur = 50 * time.Millisecond
+			for range 2 * time.Second / sleepDur {
+				if err := os.RemoveAll(gitCacheDir); err == nil {
+					t.Logf("gitstore %p cleanup successful", store)
+					return
+				}
+				time.Sleep(sleepDur)
+			}
+		}
+	})
 	mfs := &FS{
 		Store: store,
 		Client: &http.Client{
@@ -217,6 +256,7 @@ func TestNFSHandles(t *testing.T) {
 	wantCachedModules(t, h1, []string{
 		"go4.org/mem@v0.0.0-20240501181205-ae6ca9944745",
 	})
+
 	wantRegSize(t, h1, "go4.org@v0.0.0-20230225012048-214862532bf5/media/heif/heif.go", 7434)
 	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09.extracted", 0)
 	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/README", 3)

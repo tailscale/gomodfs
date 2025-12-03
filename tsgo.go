@@ -11,14 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"regexp"
 	"strings"
-	"syscall"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/tailscale/gomodfs/store"
 )
 
@@ -42,68 +37,6 @@ func validTSGoOSARCH(goos, goarch string) bool {
 		return false
 	}
 	return true
-}
-
-// tsGoRoot is Tailscale's ~/.cache/tsgo directory.
-// It pretends to the GOOS as given by the "goos" and "goarch" fields.
-//
-// It can contain two types of entries:
-//  1. ${git-hash}.extracted empty file
-//  2. ${git-hash}/ directory of contents
-//
-// Where git-hash is the hash of a github.com/tailscale/go
-// commit which becomes its release filename like
-// https://github.com/tailscale/go/releases/download/build-1cd3bf1a6eaf559aa8c00e749289559c884cef09/linux-amd64.tar.gz
-// which is downloaded and git-tree-ified to back
-// the directory in (2) above.
-type tsgoRoot struct {
-	fs.Inode
-	fs *FS
-
-	goos   string // "linux", "darwin", etc.
-	goarch string // "amd64", "arm64", etc.
-}
-
-var _ = (fs.NodeLookuper)((*tsgoRoot)(nil))
-
-var tsgoRootLookupRx = regexp.MustCompile(`^([a-f0-9]{40})(\.extracted)?$`)
-
-func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	m := tsgoRootLookupRx.FindStringSubmatch(name)
-	if m == nil {
-		return nil, syscall.ENOENT
-	}
-
-	hash, wantExtractedFile := m[1], m[2] != ""
-
-	mv, root, err := n.fs.getTailscaleGoRoot(ctx, n.goos, n.goarch, hash)
-	if err != nil {
-		log.Printf("Failed to get tailscale go root for %s/%s/%s: %v", n.goos, n.goarch, hash, err)
-		return nil, syscall.EIO
-	}
-
-	setLongTTL(out)
-
-	if wantExtractedFile {
-		// If it's a file, it must be an empty file.
-		in := n.NewInode(ctx, &memFile{
-			contents: []byte{},
-			mode:     0644,
-		}, fs.StableAttr{
-			Mode: fuse.S_IFREG | 0644,
-		})
-		return in, 0
-	}
-
-	return n.NewInode(ctx, &pathUnderZipRoot{
-		fs:   n.fs,
-		mv:   mv,
-		root: root,
-		mode: os.ModeDir,
-	}, fs.StableAttr{
-		Mode: fuse.S_IFDIR | 0755,
-	}), 0
-
 }
 
 // tsgoFile implements store.PutFile for a file in the tsgo root for use when

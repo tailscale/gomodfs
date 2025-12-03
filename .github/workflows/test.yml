@@ -24,3 +24,46 @@ jobs:
         run: choco install handle
 
       - run: go test ./...
+
+  nfs-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: go.mod
+
+      - name: build gomodfs NFS server
+        run: |
+          go build -o gomodfs.exe ./cmd/gomodfs
+
+      - name: "start gomodfs NFS server"
+        run: |
+          go run ./testing/startgomodfs
+
+      - name: "[linux] install NFS"
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y nfs-common
+
+      - name: "[windows] install NFS"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Install-WindowsFeature -Name NFS-Client
+
+      - name: "[windows] start NFS"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Start-Service -Name NfsClnt -ErrorAction SilentlyContinue
+          Start-Service -Name NfsRdr -ErrorAction SilentlyContinue
+          Get-NfsClientConfiguration | Format-List
+
+      - name: "mount gomodfs NFS"
+        run: |
+          go run ./testing/nfsmount

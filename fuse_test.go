@@ -1,6 +1,10 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// no FUSE support on Windows
+
+//go:build !windows
+
 package gomodfs
 
 import (
@@ -9,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -19,7 +24,7 @@ import (
 
 var debugFUSE = flag.Bool("debug-fuse", false, "verbose FUSE debugging")
 
-var hitNetwork = flag.Bool("run-network-tests", false, "run network tests")
+var hitNetwork = flag.Bool("run-network-tests", os.Getenv("CI") == "true", "run network tests")
 
 func TestFilesystem(t *testing.T) {
 	if !*hitNetwork {
@@ -152,6 +157,9 @@ func TestFilesystem(t *testing.T) {
 				MountOptions: fuse.MountOptions{Debug: *debugFUSE},
 			})
 			if err != nil {
+				if runtime.GOOS == "darwin" && os.Getenv("CI") == "true" {
+					t.Skipf("Mount failed on GitHub macOS runners (no FUSE kernel module); skipping test. Got error: %v", err)
+				}
 				t.Fatalf("Mount: %v", err)
 			}
 			defer func() {
@@ -182,5 +190,4 @@ func TestFilesystem(t *testing.T) {
 			}
 		})
 	}
-
 }

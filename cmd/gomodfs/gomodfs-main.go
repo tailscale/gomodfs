@@ -35,6 +35,9 @@ var (
 	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
 	portmapper     = flag.Bool("portmapper", false, "if set, run rpcbind portmapper on TCP+UDP port 111 (needed for Windows NFS clients). For NFS mode only")
 	flagWinFSP     = flag.Bool("winfsp", false, "if set, use WinFSP on Windows")
+
+	// TODO: ideally auto-detect and remove this flag.
+	flagNFSForWindows = flag.Bool("nfs-for-windows-clients", runtime.GOOS == "windows", "if set, alter NFS server behavior for Windows clients (TODO: ideally auto-detect and remove this flag)")
 )
 
 func main() {
@@ -133,7 +136,15 @@ func main() {
 			port := ln.Addr().(*net.TCPAddr).Port
 			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d,vers=3,tcp,locallocks,soft -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
-		go nfs.Serve(ln, nfsHandler)
+		nfsSrv := &nfs.Server{
+			Handler:           nfsHandler,
+			ForWindowsClients: *flagNFSForWindows,
+		}
+		go nfsSrv.Serve(ln)
+	}
+
+	if runtime.GOOS == "windows" && *flagWinFSP && mntDir == "" {
+		mntDir = "M:"
 	}
 
 	if runtime.GOOS == "windows" && *flagWinFSP && mntDir == "" {

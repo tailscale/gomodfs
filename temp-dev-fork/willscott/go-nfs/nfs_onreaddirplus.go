@@ -145,7 +145,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 			}
 		}
 	}
-	if sawOpenSet {
+	if sawOpenSet && w.ForWindowsClients {
 		// If we saw the smagic ".vfs-openset-dir" filename, lie to the client
 		// and say there's more data, so Windows won't cache the directory
 		// listing as complete and will send LOOKUP to evalate directories that

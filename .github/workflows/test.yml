@@ -24,3 +24,42 @@ jobs:
         run: choco install handle
 
       - run: go test ./...
+
+      - name: build gomodfs NFS server
+        run: |
+          go build -o gomodfs.exe ./cmd/gomodfs
+
+      - name: "start gomodfs NFS server"
+        run: |
+          go run ./testing/startgomodfs
+
+      - name: "wait for gomodfs to be started"
+        run: |
+          go run ./testing/awaitgomodfs
+
+      - name: "[windows] install NFS"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Install-WindowsFeature -Name NFS-Client
+
+      - name: "[windows] start NFS"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Start-Service -Name NfsClnt -ErrorAction SilentlyContinue
+          Start-Service -Name NfsRdr -ErrorAction SilentlyContinue
+          Get-NfsClientConfiguration | Format-List
+
+      - name: "[windows] mount NFS"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # -o anon: Mount as anonymous
+          # -o mtype=hard: Hard mount to prevent timeouts
+          # -o fileaccess=777: Attempt to force permissions (server side still rules)
+          mount.exe -o "anon,mtype=hard,fileaccess=777,nolock,casesensitive" \\127.0.0.1\modfs Z:
+          
+          # Verify mount
+          if (Test-Path Z:\) { Write-Host "Mount Successful" } else { Write-Error "Mount Failed" }
+          ls Z:\

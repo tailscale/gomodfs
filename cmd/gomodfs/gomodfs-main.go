@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ var (
 	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
 	flagMountPoint = flag.String("mount", filepath.Join(os.Getenv("HOME"), "mnt-gomodfs"), "if set, mount the filesystem at this path")
 	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
+	portmapper     = flag.Bool("portmapper", false, "if set, run rpcbind portmapper on TCP+UDP port 111 (needed for Windows NFS clients). For NFS mode only")
 )
 
 func main() {
@@ -75,6 +77,12 @@ func main() {
 		mfs.FileCacheSize = *flagMemLimitMB << 20
 	}
 
+	if *portmapper {
+		if err := startPortmapper(); err != nil {
+			log.Fatalf("Failed to start portmapper: %v", err)
+		}
+	}
+
 	nfsHandler := mfs.NFSHandler()
 
 	if *debugListen != "" {
@@ -90,14 +98,17 @@ func main() {
 			ErrorLog: log.Default(),
 		})
 
+		debugMux := http.NewServeMux()
+		debugMux.Handle("/metrics", metricsHandler)
+		debugMux.Handle("/", mfs)
+		debugMux.HandleFunc("/debug/pprof/", pprof.Index)
+		debugMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		debugMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		debugMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		debugMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
 		hs := &http.Server{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.RequestURI == "/metrics" {
-					metricsHandler.ServeHTTP(w, r)
-				} else {
-					mfs.ServeHTTP(w, r)
-				}
-			}),
+			Handler: debugMux,
 		}
 		go hs.Serve(ln)
 	}

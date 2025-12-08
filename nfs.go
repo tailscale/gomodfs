@@ -156,10 +156,12 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 		return []os.FileInfo{
 			m.fi,
 			dirFileInfo{baseName: "cache"},
+			openSetFile,
 		}, nil
 	case "cache":
 		return []os.FileInfo{
 			dirFileInfo{baseName: "download"},
+			openSetFile,
 		}, nil
 	}
 
@@ -168,7 +170,9 @@ func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 		return nil, os.ErrNotExist
 	}
 	if !mp.InZip {
-		return nil, nil
+		return []os.FileInfo{
+			openSetFile,
+		}, nil
 	}
 
 	ctx := context.TODO()

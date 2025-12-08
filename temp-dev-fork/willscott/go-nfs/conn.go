@@ -43,10 +43,16 @@ type conn struct {
 }
 
 func (c *conn) serve(ctx context.Context) {
+	defer c.Close()
+
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	c.writeSerializer = make(chan []byte, 1)
+
+	const concurrentHandlers = 32
+	c.writeSerializer = make(chan []byte, concurrentHandlers)
 	go c.serializeWrites(connCtx)
+
+	concurrentHandlerSem := make(chan bool, concurrentHandlers)
 
 	bio := bufio.NewReader(c.Conn)
 	for {
@@ -60,25 +66,33 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		Log.Tracef("request: %v", w.req)
-		err = c.handle(connCtx, w)
-		respErr := w.finish(connCtx)
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-			// failure to handle at a level needing to close the connection.
-			c.Close()
+		select {
+		case concurrentHandlerSem <- true:
+		case <-connCtx.Done():
 			return
 		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
-		}
+
+		go func() {
+			defer func() { <-concurrentHandlerSem }()
+			err := c.handle(connCtx, w)
+			if err != nil {
+				Log.Errorf("error handling req: %v", err)
+				cancel() // failure to handle at a level needing to close the connection.
+				return
+			}
+			respErr := w.finish(connCtx)
+			if respErr != nil {
+				Log.Errorf("error sending response: %v", respErr)
+				cancel() // failure to handle at a level needing to close the connection.
+				return
+			}
+		}()
 	}
 }
 
 func (c *conn) serializeWrites(ctx context.Context) {
 	// todo: maybe don't need the extra buffer
-	writer := bufio.NewWriter(c.Conn)
+	bw := bufio.NewWriter(c.Conn)
 	var fragmentBuf [4]byte
 	var fragmentInt uint32
 	for {
@@ -93,18 +107,18 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			fragmentInt = uint32(len(msg))
 			fragmentInt |= (1 << 31)
 			binary.BigEndian.PutUint32(fragmentBuf[:], fragmentInt)
-			n, err := writer.Write(fragmentBuf[:])
+			n, err := bw.Write(fragmentBuf[:])
 			if n < 4 || err != nil {
 				return
 			}
-			n, err = writer.Write(msg)
+			n, err = bw.Write(msg)
 			if err != nil {
 				return
 			}
 			if n < len(msg) {
 				panic("todo: ensure writes complete fully.")
 			}
-			if err = writer.Flush(); err != nil {
+			if err = bw.Flush(); err != nil {
 				return
 			}
 		}
@@ -117,15 +131,9 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 	handler := c.Server.handlerFor(w.req.Header.Prog, w.req.Header.Proc)
 	if handler == nil {
 		Log.Errorf("No handler for %d.%d", w.req.Header.Prog, w.req.Header.Proc)
-		if err := w.drain(ctx); err != nil {
-			return err
-		}
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
 	appError := handler(ctx, w, c.Server.Handler)
-	if drainErr := w.drain(ctx); drainErr != nil {
-		return drainErr
-	}
 	if appError != nil && !w.responded {
 		if err := c.err(ctx, w, appError); err != nil {
 			return err
@@ -171,10 +179,13 @@ type request struct {
 }
 
 func (r *request) String() string {
-	if r.Header.Prog == nfsServiceID {
+	switch r.Header.Prog {
+	case nfsServiceID:
 		return fmt.Sprintf("RPC #%d (nfs.%s)", r.xid, NFSProcedure(r.Header.Proc))
-	} else if r.Header.Prog == mountServiceID {
+	case mountServiceID:
 		return fmt.Sprintf("RPC #%d (mount.%s)", r.xid, MountProcedure(r.Header.Proc))
+	case lockServiceID:
+		return fmt.Sprintf("RPC #%d (lock.%d)", r.xid, r.Header.Proc)
 	}
 	return fmt.Sprintf("RPC #%d (%d.%d)", r.xid, r.Header.Prog, r.Header.Proc)
 }
@@ -250,22 +261,6 @@ func (w *response) Write(dat []byte) error {
 	return nil
 }
 
-// drain reads the rest of the request frame if not consumed by the handler.
-func (w *response) drain(ctx context.Context) error {
-	if reader, ok := w.req.Body.(*io.LimitedReader); ok {
-		if reader.N == 0 {
-			return nil
-		}
-		// todo: wrap body in a context reader.
-		_, err := io.CopyN(io.Discard, w.req.Body, reader.N)
-		if err == nil || err == io.EOF {
-			return nil
-		}
-		return err
-	}
-	return io.ErrUnexpectedEOF
-}
-
 func (w *response) finish(ctx context.Context) error {
 	select {
 	case w.conn.writeSerializer <- w.writer.Bytes():
@@ -275,32 +270,64 @@ func (w *response) finish(ctx context.Context) error {
 	}
 }
 
-func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *response, err error) {
-	fragment, err := xdr.ReadUint32(reader)
-	if err != nil {
-		if xdrErr, ok := err.(*xdr2.UnmarshalError); ok {
-			if xdrErr.Err == io.EOF {
-				return nil, io.EOF
+const lastFragMask = 1 << 31
+const maxRPCSize = 10 << 20 // 10MB
+
+func ReadRPCRecord(br *bufio.Reader) ([]byte, error) {
+	var msg []byte
+	for {
+		frag, err := xdr.ReadUint32(br)
+		if err != nil {
+			if xdrErr, ok := err.(*xdr2.UnmarshalError); ok {
+				if xdrErr.Err == io.EOF {
+					return nil, io.EOF
+				}
 			}
+			return nil, err
 		}
-		return nil, err
-	}
-	if fragment&(1<<31) == 0 {
-		Log.Warnf("Warning: haven't implemented fragment reconstruction.\n")
-		return nil, ErrInputInvalid
-	}
-	reqLen := fragment - uint32(1<<31)
-	if reqLen < 40 {
-		return nil, ErrInputInvalid
-	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
+		last := frag&lastFragMask != 0
+		n := int64(frag &^ lastFragMask)
+		if n+int64(len(msg)) > maxRPCSize {
+			return nil, fmt.Errorf("fragment size %d too large", n)
+		}
 
-	xid, err := xdr.ReadUint32(&r)
+		// TODO(bradfitz): optimize for common case of single-fragment messages
+		// by avoiding the extra allocation and copy and just use br.Peek(n),
+		// get the memory, then br.Discard(n), knowing the buffer is still valid
+		// until used again. And then just document that limitation.
+
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return nil, err
+		}
+		if msg == nil && last {
+			// Common case: single-fragment message
+			return buf, nil
+		}
+		msg = append(msg, buf...)
+		if last {
+			return msg, nil
+		}
+	}
+}
+
+func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *response, err error) {
+	rpcMsg, err := ReadRPCRecord(reader)
 	if err != nil {
 		return nil, err
 	}
-	reqType, err := xdr.ReadUint32(&r)
+	if len(rpcMsg) < 40 {
+		return nil, ErrInputInvalid
+	}
+
+	r := bytes.NewReader(rpcMsg)
+
+	xid, err := xdr.ReadUint32(r)
+	if err != nil {
+		return nil, err
+	}
+	reqType, err := xdr.ReadUint32(r)
 	if err != nil {
 		return nil, err
 	}
@@ -311,9 +338,9 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	req := request{
 		xid,
 		rpc.Header{},
-		&r,
+		r,
 	}
-	if err = xdr.Read(&r, &req.Header); err != nil {
+	if err = xdr.Read(r, &req.Header); err != nil {
 		return nil, err
 	}
 

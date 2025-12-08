@@ -55,7 +55,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return err
 	}
-	if obj.Cookie > 0 && obj.CookieVerif > 0 && verifier != obj.CookieVerif {
+	if obj.Cookie > 0 && obj.CookieVerif > 0 && !cookieVerifierEqual(verifier, obj.CookieVerif) {
 		return &NFSStatusError{NFSStatusBadCookie, nil}
 	}
 
@@ -88,7 +88,11 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	maxEntities := userHandle.HandleLimit() / 2
 	fb := 0
 	fss := 0
+	sawOpenSet := false
 	for i, c := range contents {
+		if !sawOpenSet && c.Name() == ".vfs-openset-dir" {
+			sawOpenSet = true
+		}
 		// cookie equates to index within contents + 2 (for '.' and '..')
 		cookie := uint64(i + 2)
 		fb++
@@ -140,6 +144,14 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 				return &NFSStatusError{NFSStatusServerFault, err}
 			}
 		}
+	}
+	if sawOpenSet {
+		// If we saw the smagic ".vfs-openset-dir" filename, lie to the client
+		// and say there's more data, so Windows won't cache the directory
+		// listing as complete and will send LOOKUP to evalate directories that
+		// are open sets (have an unknown number of filenames that aren't known
+		// at runtime until the user asks for them).
+		eof = false
 	}
 	if err := xdr.Write(writer, eof); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}

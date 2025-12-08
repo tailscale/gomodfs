@@ -28,6 +28,19 @@ type readDirEntity struct {
 	Next   bool
 }
 
+func cookieVerifierEqual(a, b uint64) bool {
+	if a == b {
+		return true
+	}
+
+	// check for byte-reversed equality (to work around Microsoft's NFSv3 client
+	// bug)
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], a)
+	reversed := binary.BigEndian.Uint64(buf[:])
+	return reversed == b
+}
+
 func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = opAttrErrorFormatter
 	obj := readDirArgs{}
@@ -49,7 +62,7 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return err
 	}
-	if obj.Cookie > 0 && obj.CookieVerif > 0 && verifier != obj.CookieVerif {
+	if obj.Cookie > 0 && obj.CookieVerif > 0 && !cookieVerifierEqual(verifier, obj.CookieVerif) {
 		return &NFSStatusError{NFSStatusBadCookie, nil}
 	}
 

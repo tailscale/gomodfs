@@ -15,6 +15,8 @@ func init() {
 	_ = RegisterMessageHandler(mountServiceID, uint32(MountProcNull), onMountNull)
 	_ = RegisterMessageHandler(mountServiceID, uint32(MountProcMount), onMount)
 	_ = RegisterMessageHandler(mountServiceID, uint32(MountProcUmnt), onUMount)
+	_ = RegisterMessageHandler(mountServiceID, uint32(MountProcUmntAll), onUMountAll)
+	_ = RegisterMessageHandler(mountServiceID, uint32(MountProcExport), onMountExport)
 }
 
 func onMountNull(ctx context.Context, w *response, userHandle Handler) error {
@@ -55,4 +57,36 @@ func onUMount(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	return w.writeHeader(ResponseCodeSuccess)
+}
+
+func onUMountAll(ctx context.Context, w *response, userHandle Handler) error {
+	return w.writeHeader(ResponseCodeSuccess)
+}
+
+func onMountExport(ctx context.Context, w *response, userHandle Handler) error {
+	if err := w.writeHeader(ResponseCodeSuccess); err != nil {
+		return err
+	}
+
+	// Build one export entry:
+	// ex_dir   = "gomodfs"
+	// ex_groups = NULL
+	// ex_next   = NULL
+	var buf bytes.Buffer
+
+	// ex_dir (string)
+	if err := xdr.Write(&buf, "gomodfs"); err != nil {
+		return err
+	}
+
+	// ex_groups = NULL (no groups present)
+	if err := xdr.Write(&buf, false); err != nil {
+		return err
+	}
+	// ex_next = NULL (no next entry)
+	if err := xdr.Write(&buf, false); err != nil {
+		return err
+	}
+
+	return w.Write(buf.Bytes())
 }

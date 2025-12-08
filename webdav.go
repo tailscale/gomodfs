@@ -302,6 +302,13 @@ func (wdDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 	return nil, webdav.ErrNotImplemented
 }
 
+var openSetFile = regFileInfo{
+	name:    ".vfs-openset-dir",
+	size:    0,
+	mode:    0444,
+	modTime: fakeStaticFileTime,
+}
+
 type regFileInfo struct {
 	name       string
 	size       int64

@@ -25,7 +25,7 @@ import (
 	"golang.org/x/mod/module"
 )
 
-func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (FileServer, error) {
+func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (MountRunner, error) {
 	root := &moduleNameNode{
 		fs: f,
 	}

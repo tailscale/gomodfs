@@ -2,7 +2,7 @@
 
 # gomodfs
 
-`gomodfs` is a virtual filesystem (supporting FUSE, WebDAV, and NFS) that
+`gomodfs` is a virtual filesystem (supporting FUSE, WebDAV, NFSv3, and WinFsp) that
 implements a read-only filesystem emulating the [`GOMODCACHE` directory
 layout](https://go.dev/ref/mod#module-cache) that has all Go modules accessible,
 without making the `cmd/go` tool ever think it needs to download anything.
@@ -30,7 +30,7 @@ FUSE is best for Linux. It's works on macOS too, but it's tedious,
 especially on EC2 VMs where you need to configure SIP & MDM to get it
 kernel extensions working.
 
-`gomodfs` also includes a WebDAV and NFS server.
+`gomodfs` also includes a WebDAV and NFSv3 server.
 
 The WebDAV support came first and was found a little lacking (the
 macOS kernel forces `noexec` on those mounts), so we also added NFS support.
@@ -42,6 +42,9 @@ and https://github.com/docker/for-mac/issues/7059.
 
 As such, we ended up using NFS. `gomodfs` runs an NFS server on the host
 and we mount it in the guest VMs.
+
+Windows includes NFSv3 client support, but it's not very performant.
+To address that, we also added [WinFsp](https://winfsp.dev/) support.
 
 # Backends
 

@@ -31,15 +31,20 @@ var (
 	verbose        = flag.Bool("verbose", false, "enable verbose logging")
 	useWebDAV      = flag.Bool("webdav", false, "use WebDAV instead of FUSE (useful on macOS w/o kernel extensions allowed)")
 	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
-	flagMountPoint = flag.String("mount", filepath.Join(os.Getenv("HOME"), "mnt-gomodfs"), "if set, mount the filesystem at this path")
+	flagMountPoint = flag.String("mount", "", "if set, mount the filesystem at this path")
 	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
 	portmapper     = flag.Bool("portmapper", false, "if set, run rpcbind portmapper on TCP+UDP port 111 (needed for Windows NFS clients). For NFS mode only")
+	flagWinFSP     = flag.Bool("winfsp", false, "if set, use WinFSP on Windows")
 )
 
 func main() {
 	flag.Parse()
 
-	gitCache := filepath.Join(os.Getenv("HOME"), ".cache", "gomodfs")
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("os.UserHomeDir: %v", err)
+	}
+	gitCache := filepath.Join(homeDir, ".cache", "gomodfs")
 	if err := os.MkdirAll(gitCache, 0755); err != nil {
 		log.Panicf("Failed to create git cache directory %s: %v", gitCache, err)
 	}
@@ -131,17 +136,22 @@ func main() {
 		go nfs.Serve(ln, nfsHandler)
 	}
 
+	if runtime.GOOS == "windows" && *flagWinFSP && mntDir == "" {
+		mntDir = "M:"
+	}
+
 	if mntDir == "" {
 		log.Printf("Not mounting filesystem, use --mount flag to specify mount point")
 		select {}
 	}
 
-	var err error
-	var mount gomodfs.FileServer
+	var mount gomodfs.MountRunner
 	if *useWebDAV {
 		mount, err = mfs.MountWebDAV(mntDir, &gomodfs.MountOpts{
 			Debug: *verbose,
 		})
+	} else if *flagWinFSP {
+		mount, err = mfs.MountWinFSP(mntDir)
 	} else if *flagNFS != "" {
 		err = mfs.MountNFS(mntDir, nfsListenAddr)
 	} else {
@@ -154,7 +164,9 @@ func main() {
 	}
 
 	log.Printf("Mounted on %s", mntDir)
-	log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
+	if runtime.GOOS != "windows" {
+		log.Printf("Unmount by calling 'umount' (macOS) or 'fusermount -u' (Linux) with arg %s", mntDir)
+	}
 
 	if mount != nil {
 		mount.Wait()

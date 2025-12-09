@@ -263,6 +263,8 @@ func (wd wdRegularFile) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 // wdDir is a [webdav.File] implementation that represents a directory
 // in the gomodfs store.
 type wdDir struct {
+	dummyFSPGoFileDir
+
 	pathInZip string // the path within the zip file, for debug logs
 	baseName  string
 	ents      []store.Dirent
@@ -352,6 +354,7 @@ type emptyDir struct {
 	fs *FS
 
 	baseName string
+	dummyFSPGoFileDir
 	webdav.File
 }
 
@@ -373,4 +376,22 @@ func (ed *emptyDir) DeadProps() (map[xml.Name]webdav.Property, error) {
 
 func (ed *emptyDir) Patch([]webdav.Proppatch) ([]webdav.Propstat, error) {
 	return nil, webdav.ErrNotImplemented
+}
+
+// dummyFSPGoFileDir is an empty struct to embed to add
+// winfsp/gofs.File methods that we don't need to implement
+// on a directory.
+type dummyFSPGoFileDir struct{}
+
+func (dummyFSPGoFileDir) ReadAt(p []byte, off int64) (n int, err error) {
+	return 0, os.ErrInvalid
+}
+
+// For winfsp.go to use; emptyDir needs to implement winfsp/gofs.File.
+func (dummyFSPGoFileDir) Sync() error { return nil }
+
+func (dummyFSPGoFileDir) Truncate(int64) error { return os.ErrPermission }
+
+func (dummyFSPGoFileDir) WriteAt(p []byte, off int64) (n int, err error) {
+	return 0, os.ErrInvalid
 }

@@ -14,6 +14,10 @@ type Server struct {
 	Handler
 	ID [8]byte
 	context.Context
+
+	// ForWindowsClients indicates whether the clients of this
+	// NFS server will be Windows machines.
+	ForWindowsClients bool
 }
 
 // RegisterMessageHandler registers a handler for a specific

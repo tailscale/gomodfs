@@ -7,6 +7,6 @@ package gomodfs
 
 import "errors"
 
-func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (FileServer, error) {
+func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (MountRunner, error) {
 	return nil, errors.New("FUSE mounting is not supported on Windows; use NFS or WebDAV mode instead")
 }

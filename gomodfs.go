@@ -669,12 +669,12 @@ type MountOpts struct {
 	Debug bool // if true, enables debug logging
 }
 
-type FileServer interface {
+type MountRunner interface {
 	Unmount() error
 	Wait()
 }
 
-func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (FileServer, error) {
+func (f *FS) MountWebDAV(mntPoint string, opt *MountOpts) (MountRunner, error) {
 	if runtime.GOOS != "darwin" {
 		return nil, fmt.Errorf("gomodfs: WebDAV mount is currently only supported on macOS")
 	}

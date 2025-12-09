@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"log"
 	"path"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -145,7 +146,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 			}
 		}
 	}
-	if sawOpenSet {
+	if sawOpenSet && w.ForWindowsClients {
 		// If we saw the smagic ".vfs-openset-dir" filename, lie to the client
 		// and say there's more data, so Windows won't cache the directory
 		// listing as complete and will send LOOKUP to evalate directories that
@@ -153,6 +154,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 		// at runtime until the user asks for them).
 		eof = false
 	}
+	log.Printf("XXX onReadDirPlus: served %d entries for path %v; eof=%v (windows=%v)", len(entities), p, eof, w.ForWindowsClients)
 	if err := xdr.Write(writer, eof); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

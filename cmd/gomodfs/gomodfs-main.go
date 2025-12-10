@@ -137,8 +137,8 @@ func main() {
 			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d,vers=3,tcp,locallocks,soft -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
 		nfsSrv := &nfs.Server{
-			Handler:           nfsHandler,
-			ForWindowsClients: *flagNFSForWindows,
+			Handler: nfsHandler,
+			Verbose: *verbose,
 		}
 		go nfsSrv.Serve(ln)
 	}

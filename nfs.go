@@ -141,14 +141,14 @@ func (b billyFS) Chroot(path string) (billy.Filesystem, error) {
 
 func (b billyFS) Root() string {
 	if b.fs.Verbose {
-		b.fs.logf("NFS: billyFS.Root called")
+		b.fs.logf("billyFS.Root() = /")
 	}
 	return "/"
 }
 
 func (b billyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	if b.fs.Verbose {
-		b.fs.logf("NFS ReadDir(%q)", path)
+		b.fs.logf("billyFS.ReadDir(%q)", path)
 	}
 	switch path {
 	case "":

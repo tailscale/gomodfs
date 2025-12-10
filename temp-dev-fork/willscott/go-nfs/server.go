@@ -14,21 +14,7 @@ type Server struct {
 	Handler
 	ID [8]byte
 	context.Context
-
-	// ForWindowsClients indicates whether the clients of this
-	// NFS server will be Windows machines.
-	//
-	// TODO(bradfitz): this is a big hack to get Windows clients to
-	// not cache READDIRPLUS results and to issue LOOKUP calls
-	// in "open set" directories. But setting this then breaks
-	// non-Windows clients. We should ideally auto-detect this
-	// based on client RPC credentials or something else.
-	//
-	// Or even better, not much with the READDIRPLUS EOF result
-	// and instead make open set directories have a random
-	// cookie verifier each time the directory contents change
-	// or something.
-	ForWindowsClients bool
+	Verbose bool // if true, enable verbose logging
 }
 
 // RegisterMessageHandler registers a handler for a specific

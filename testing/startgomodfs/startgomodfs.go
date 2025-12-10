@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -27,7 +28,12 @@ const (
 	pidPath = "./gomodfs.pid"
 )
 
+var (
+	useWinFSP = flag.Bool("winfsp", false, "on Windows, use WinFSP to mount the filesystem")
+)
+
 func main() {
+	flag.Parse()
 	if os.Getenv("CI") != "true" {
 		log.Fatalf("startgomodfs is only intended to be run in CI")
 	}
@@ -36,10 +42,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("creating log file: %v", err)
 	}
-	cmd := exec.Command(binPath, "-http-debug=127.0.0.1:8080", "-mount=", "-nfs=:2049", "-verbose")
-	if runtime.GOOS == "windows" {
-		cmd.Args = append(cmd.Args, "-portmapper")
+
+	var cmd *exec.Cmd
+	if *useWinFSP && runtime.GOOS == "windows" {
+		cmd = exec.Command(binPath, "-http-debug=127.0.0.1:8080", "-mount=M:", "-winfsp", "-verbose")
+	} else {
+		cmd = exec.Command(binPath, "-http-debug=127.0.0.1:8080", "-mount=", "-nfs=:2049", "-verbose")
+		if runtime.GOOS == "windows" {
+			cmd.Args = append(cmd.Args, "-portmapper")
+		}
 	}
+
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if runtime.GOOS != "windows" {
@@ -51,8 +64,10 @@ func main() {
 	}
 
 	// Before we start, verify that the NFS port is not already in use.
-	if err := port2049Up(); err == nil {
-		log.Fatalf("NFS port 2049 is already in use; is gomodfs already running?")
+	if !*useWinFSP {
+		if err := port2049Up(); err == nil {
+			log.Fatalf("NFS port 2049 is already in use; is gomodfs already running?")
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -111,5 +126,9 @@ func checkUp() error {
 		return fmt.Errorf("status %v; log: %s", resp.Status, log)
 	}
 
+	if *useWinFSP {
+		// No NFS server to check.
+		return nil
+	}
 	return port2049Up()
 }

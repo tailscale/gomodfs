@@ -24,3 +24,6 @@ benchcorp:
 	cd "$${HOME}/src/tailscale.io"; \
 	echo "corp test build..."; \
 	time go test -exec=true tailscale.io/...; \
+
+pushbradwin:
+	GOOS=windows GOARCH=amd64 go build -o /Volumes/home/gomodfs.exe ./cmd/gomodfs

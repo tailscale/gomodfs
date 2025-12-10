@@ -585,7 +585,7 @@ type statusFileNode struct {
 }
 
 func (n *statusFileNode) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	return &statusFH{json: n.fs.statusJSON()}, fuse.FOPEN_DIRECT_IO, 0
+	return &statusFH{json: n.fs.StatusJSON()}, fuse.FOPEN_DIRECT_IO, 0
 }
 
 type statusFH struct {

@@ -6,9 +6,20 @@ on:
       - "main"
   pull_request:
 
+concurrency:
+  # For PRs, later CI runs preempt previous ones. e.g. a force push on a PR
+  # cancels running CI jobs and starts all new ones.
+  #
+  # For non-PR pushes, concurrency.group needs to be unique for every distinct
+  # CI run we want to have happen. Use run_id, which in practice means all
+  # non-PR CI runs will be allowed to run without preempting each other.
+  group: ${{ github.workflow }}-$${{ github.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
+      fail-fast: false # don't abort the entire matrix if one element fails
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -19,14 +30,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: "[windows] install handle.exe"
-        if: runner.os == 'Windows'
-        run: choco install handle
-
       - run: go test ./...
 
   nfs-test:
     strategy:
+      fail-fast: false # don't abort the entire matrix if one element fails
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -67,3 +75,115 @@ jobs:
       - name: "mount gomodfs NFS"
         run: |
           go run ./testing/nfsmount
+
+      - name: "[unix] list GOMODCACHE directory"
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          ls -l $GOMODCACHE
+
+      - name: "[windows] list GOMODCACHE directory"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          dir $env:GOMODCACHE
+
+      - name: "show gomodfs status (1)"
+        shell: bash
+        run: |
+          cat $GOMODCACHE/.gomodfs-status
+
+      # so go.mod go version differences in testdata go.mod files don't
+      # cause Go to download different Go toolchains and fail to write
+      # to GOMODCACHE.
+      - name: disable GOTOOLCHAIN downloads
+        run: echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+
+      - name: "run go env"
+        working-directory: testdata/exoticmod
+        run: |
+          go env
+
+      # NFS can't handle UTF-8 filenames on Windows, so skip this step there.
+      - name: "[unix] run go mod verify"
+        if: runner.os != 'Windows'
+        working-directory: testdata/exoticmod
+        run: |
+          go mod verify
+
+      # NFS can't handle UTF-8 filenames on Windows, so skip this step there.
+      - name: "[windows] run go mod verify"
+        if: runner.os == 'Windows'
+        working-directory: testdata/go4mod
+        run: |
+          go mod verify
+
+      - name: "show gomodfs status (2)"
+        shell: bash
+        run: |
+          cat $GOMODCACHE/.gomodfs-status
+
+      - name: "verify used"
+        run: |
+          go test -v ./testing/ci '-verify-used'
+
+  winfsp-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: go.mod
+
+      - name: build gomodfs
+        run: |
+          go build -o gomodfs.exe ./cmd/gomodfs
+
+      - name: "[windows] install winfsp"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          winget install --id=WinFsp.WinFsp --source=winget
+
+      - name: "start gomodfs winfsp server"
+        run: |
+          go run ./testing/startgomodfs --winfsp
+
+      - name: "set GOMODCACHE"
+        shell: powershell
+        run: |
+          echo "GOMODCACHE=M:\" >> $env:GITHUB_ENV
+
+      # so go.mod go version differences in testdata go.mod files don't
+      # cause Go to download different Go toolchains and fail to write
+      # to GOMODCACHE.
+      - name: disable GOTOOLCHAIN downloads
+        shell: powershell
+        run: echo "GOTOOLCHAIN=local" >> $env:GITHUB_ENV
+
+      - name: list drives
+        shell: powershell
+        run: Get-PSDrive -PSProvider FileSystem
+
+      - name: "list GOMODCACHE directory"
+        shell: powershell
+        run: |
+          dir $env:GOMODCACHE
+
+      - name: "show gomodfs status (1)"
+        shell: powershell
+        run: |
+          Get-Content -Path $env:GOMODCACHE\.gomodfs-status
+
+      - name: "run go mod verify"
+        working-directory: testdata/exoticmod
+        run: go mod verify
+
+      - name: "show gomodfs status (2)"
+        shell: powershell
+        run: |
+          Get-Content -Path $env:GOMODCACHE\.gomodfs-status
+
+      - name: "verify used"
+        run: |
+          go test -v ./testing/ci '-verify-used'

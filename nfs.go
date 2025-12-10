@@ -76,7 +76,7 @@ func (h *NFSHandler) statusFile() *statusMeta {
 	if fs.statusCache != nil && time.Since(fs.statusCache.fi.ModTime()) < regenEvery {
 		return fs.statusCache
 	}
-	j := h.fs.statusJSON()
+	j := h.fs.StatusJSON()
 	fs.statusCache = &statusMeta{
 		fi: regFileInfo{
 			name:    statusFile,

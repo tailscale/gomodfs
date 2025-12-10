@@ -604,7 +604,9 @@ func (fs *FS) addPathHashTargetLocked(path string) {
 
 var procStart = time.Now()
 
-type procStat struct {
+// StatusJSON is the JSON type of the <root>/.gomodfs-status file and the debug
+// HTTP handler's /status.json endpoint.
+type StatusJSON struct {
 	Filesystem string                   `json:"filesystem"`
 	Uptime     float64                  `json:"uptime"` // seconds since process start
 	Ops        map[string]*stats.OpStat `json:"ops,omitzero"`
@@ -650,10 +652,11 @@ func (s *FS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Stats.ServeHTTP(w, r)
 }
 
-// statusJSON returns the JSON-encoded status
-// of the <root>/.gomodfs-status file.
-func (f *FS) statusJSON() []byte {
-	stj, _ := json.MarshalIndent(procStat{
+// StatusJSON returns the JSON-encoded status
+// of the <root>/.gomodfs-status file and the debug
+// HTTP handler's /status.json endpoint.
+func (f *FS) StatusJSON() []byte {
+	stj, _ := json.MarshalIndent(StatusJSON{
 		Filesystem: "gomodfs",
 		Uptime:     time.Since(procStart).Seconds(),
 		Ops:        f.Stats.Clone(),

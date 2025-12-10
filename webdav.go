@@ -170,7 +170,7 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 	if dp.WellKnown != "" {
 		switch dp.WellKnown {
 		case statusFile:
-			return newWDFileFromContents(base, d.fs.statusJSON()), nil
+			return newWDFileFromContents(base, d.fs.StatusJSON()), nil
 		case wkTSGoExtracted:
 			return newWDFileFromContents(base, nil), nil
 		}

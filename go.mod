@@ -1,8 +1,6 @@
 module github.com/tailscale/gomodfs
 
-go 1.24.4
-
-toolchain go1.24.6
+go 1.25.1
 
 require (
 	github.com/aegistudio/go-winfsp v1.0.1
@@ -19,6 +17,7 @@ require (
 	golang.org/x/mod v0.26.0
 	golang.org/x/net v0.42.0
 	golang.org/x/sync v0.16.0
+	golang.org/x/sys v0.34.0
 	tailscale.com v1.86.4
 )
 
@@ -41,7 +40,6 @@ require (
 	github.com/sergi/go-diff v1.4.0 // indirect
 	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac // indirect
-	golang.org/x/sys v0.34.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )

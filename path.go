@@ -17,8 +17,9 @@ import (
 // for paths received from WebDAV Stat or OpenFile calls.
 type gmPath struct {
 	// WellKnown, if non-empty, indicates that the path is
-	// for a well-known gomodfs path. The only possible value
-	// so far is ".gomodfs-status", for the status file.
+	// for a well-known gomodfs path. The only possible values
+	// so far are ".gomodfs-status", for the status file,
+	// and "tsgo.extracted" (see wkTSGoExtracted).
 	WellKnown string
 
 	// NotExist indicates that the path does not exist.

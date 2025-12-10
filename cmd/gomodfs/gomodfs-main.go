@@ -56,7 +56,7 @@ func main() {
 	cmd.Run() // best effort
 
 	mntDir := *flagMountPoint
-	if mntDir != "" {
+	if mntDir != "" && runtime.GOOS != "windows" {
 		exec.Command("umount", mntDir).Run() // best effort
 		if os.Getenv("GOOS") == "darwin" {
 			exec.Command("diskutil", "unmount", "force", mntDir).Run() // best effort
@@ -108,6 +108,10 @@ func main() {
 
 		debugMux := http.NewServeMux()
 		debugMux.Handle("/metrics", metricsHandler)
+		debugMux.HandleFunc("/status.json", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(mfs.StatusJSON())
+		})
 		debugMux.Handle("/", mfs)
 		debugMux.HandleFunc("/debug/pprof/", pprof.Index)
 		debugMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -141,10 +145,6 @@ func main() {
 			ForWindowsClients: *flagNFSForWindows,
 		}
 		go nfsSrv.Serve(ln)
-	}
-
-	if runtime.GOOS == "windows" && *flagWinFSP && mntDir == "" {
-		mntDir = "M:"
 	}
 
 	if runtime.GOOS == "windows" && *flagWinFSP && mntDir == "" {

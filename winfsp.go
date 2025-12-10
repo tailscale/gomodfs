@@ -21,6 +21,7 @@ import (
 	"github.com/aegistudio/go-winfsp"
 	"github.com/aegistudio/go-winfsp/gofs"
 	"github.com/tailscale/gomodfs/store"
+	"golang.org/x/sys/windows"
 )
 
 type winFSPRunner struct {
@@ -30,7 +31,9 @@ type winFSPRunner struct {
 
 func (mfs *FS) MountWinFSP(mntPoint string) (MountRunner, error) {
 	fspFS, err := winfsp.Mount(
-		gofs.New(&fspFS{fs: mfs}),
+		fspBaseBehaviorWrapper{
+			gofs.New(&fspFS{fs: mfs}).(goFSImpl),
+		},
 		mntPoint, // e.g. "M:"
 		winfsp.FileSystemName("gomodfs"),
 		winfsp.Attributes(winfsp.FspFSAttributeReadOnlyVolume),
@@ -46,10 +49,51 @@ func (mfs *FS) MountWinFSP(mntPoint string) (MountRunner, error) {
 	return s, nil
 }
 
+// foFSImpl is the interface implemented by the
+// the "base" filesystem returned by [gofs.New].
+type goFSImpl interface {
+	winfsp.BehaviourBase
+	winfsp.BehaviourGetSecurityByName
+	winfsp.BehaviourCreate
+	winfsp.BehaviourOverwrite
+	winfsp.BehaviourReadDirectory
+	winfsp.BehaviourGetFileInfo
+	winfsp.BehaviourGetSecurity
+	winfsp.BehaviourGetVolumeInfo
+	winfsp.BehaviourSetVolumeLabel
+	winfsp.BehaviourSetBasicInfo
+	winfsp.BehaviourSetFileSize
+	winfsp.BehaviourRead
+	winfsp.BehaviourWrite
+	winfsp.BehaviourFlush
+	winfsp.BehaviourCanDelete
+	winfsp.BehaviourCleanup
+	winfsp.BehaviourRename
+}
+
+// fspBaseBehavior implements [winfsp.BehaviourBase] by
+// wrapping a gofs.New filesystem.
+//
+// It exists purely so we can unset the windows.FILE_OPEN_NO_RECALL bit
+// from OpenFile calls. Otherwise PowerShell sets it and then
+// winfsp/gofs rejects the open, which is arguably a bug.
+// But we just work around it for now.
+type fspBaseBehaviorWrapper struct {
+	goFSImpl
+}
+
+func (w fspBaseBehaviorWrapper) Open(fs *winfsp.FileSystemRef, name string,
+	createOptions, grantedAccess uint32,
+	info *winfsp.FSP_FSCTL_FILE_INFO,
+) (uintptr, error) {
+	// Clear the FILE_OPEN_NO_RECALL bit
+	createOptions &^= windows.FILE_OPEN_NO_RECALL
+	return w.goFSImpl.Open(fs, name, createOptions, grantedAccess, info)
+}
+
 // fspFS implements [gofs.FileSystem].
 type fspFS struct {
-	fs      *FS
-	verbose bool
+	fs *FS
 }
 
 var _ gofs.FileSystem = &fspFS{}
@@ -72,6 +116,11 @@ var (
 		size: int64(len(helloMsg)),
 	}
 
+	statusStat os.FileInfo = regFileInfo{
+		name: statusFile,
+		size: 4 << 10,
+	}
+
 	rootStat os.FileInfo = dirFileInfo{baseName: "\\"}
 )
 
@@ -86,6 +135,11 @@ func unixifyPath(name string) string {
 func (pfs *fspFS) Stat(name string) (fi os.FileInfo, retErr error) {
 	ctx := context.Background()
 	name = unixifyPath(name)
+	if pfs.fs.Verbose {
+		defer func() {
+			log.Printf("fspFS.Stat(%q) = %v, %v", name, fi, retErr)
+		}()
+	}
 
 	if name == "" {
 		return rootStat, nil
@@ -105,18 +159,15 @@ func (pfs *fspFS) Stat(name string) (fi os.FileInfo, retErr error) {
 		sp.End(spErr)
 	}()
 
-	if d.verbose {
-		defer func() {
-			log.Printf("fsp.Stat(%q) = %T, %v", name, fi, retErr)
-		}()
-	}
-
 	dp := parsePath(name)
 	if dp.NotExist {
 		d.fs.Stats.StartSpan("fsp.Stat.NotExist").End(nil)
 		return nil, os.ErrNotExist
 	}
 	if dp.WellKnown != "" {
+		if dp.WellKnown == statusFile {
+			return statusStat, nil
+		}
 		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
@@ -160,6 +211,7 @@ var rootDir gofs.File = &dirWithEnts{
 	fi: rootStat,
 	ents: []os.FileInfo{
 		helloStat,
+		statusStat,
 	},
 }
 
@@ -169,12 +221,19 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 	}
 	name = unixifyPath(name)
 
+	if pfs.fs.Verbose {
+		defer func() {
+			log.Printf("fspFS.OpenFile(%q, %d) = %T, %v", name, flag, retFile, retErr)
+		}()
+	}
+
 	if name == "" {
 		return rootDir, nil
 	}
 	if name == "gomodfs hello.txt" {
 		return newFWPFileFromContents(name, []byte(helloMsg)), nil
 	}
+
 	ctx := context.Background()
 
 	d := pfs
@@ -189,12 +248,6 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 		}
 	}()
 
-	if d.verbose {
-		defer func() {
-			log.Printf("fspFS.OpenFile(%q, %d) = %T, %v", name, flag, retFile, retErr)
-		}()
-	}
-
 	// Reject if any write flag is set.
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0 {
 		spOK = true // don't treat span as an error
@@ -208,7 +261,7 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 	if dp.WellKnown != "" {
 		switch dp.WellKnown {
 		case statusFile:
-			return newFWPFileFromContents(base, d.fs.statusJSON()), nil
+			return newFWPFileFromContents(base, pfs.fs.StatusJSON()), nil
 		case wkTSGoExtracted:
 			return newFWPFileFromContents(base, nil), nil
 		}

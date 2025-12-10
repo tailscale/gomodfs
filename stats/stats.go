@@ -32,6 +32,11 @@ type OpStat struct {
 	TotalDur time.Duration
 }
 
+// NumSuccess returns the number of successful operations.
+func (os *OpStat) NumSuccess() int {
+	return os.Ended - os.Errs
+}
+
 // Stats holds the operation statistics for the gomodfs file system.
 //
 // If nil, no statistics are collected.

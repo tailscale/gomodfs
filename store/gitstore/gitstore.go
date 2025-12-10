@@ -867,10 +867,10 @@ func (s *Storage) GetZipRoot(ctx context.Context, mv store.ModuleVersion) (store
 		return zero, fmt.Errorf("failed to get zip root tree for %v: %w", mv, err)
 	}
 
-	return s.newModeHandle(mv, treeObj.hash)
+	return s.newModHandle(mv, treeObj.hash)
 }
 
-func (s *Storage) newModeHandle(mv store.ModuleVersion, modTree objRef) (store.ModHandle, error) {
+func (s *Storage) newModHandle(mv store.ModuleVersion, modTree objRef) (store.ModHandle, error) {
 	var zero store.ModHandle
 
 	mh := &modHandle{
@@ -926,6 +926,14 @@ func (s *Storage) newModeHandle(mv store.ModuleVersion, modTree objRef) (store.M
 			}
 		}
 		pathFromRoot := string(rest)
+		if strings.HasPrefix(pathFromRoot, `"`) {
+			// Git-escaped path (contains special characters).
+			var err error
+			pathFromRoot, err = strconv.Unquote(pathFromRoot)
+			if err != nil {
+				return zero, fmt.Errorf("failed to unquote git-escaped path in ls-tree line %#q: %w", line, err)
+			}
+		}
 
 		if !mode.IsDir() {
 			mh.blobMeta[pathFromRoot] = blobMeta{
@@ -1005,7 +1013,7 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 		return nil, fmt.Errorf("failed to update tree ref %q: %w: %s", ref, err, out)
 	}
 
-	return s.newModeHandle(mv, treeHash)
+	return s.newModHandle(mv, treeHash)
 }
 
 func (s *Storage) Readdir(ctx context.Context, h store.ModHandle, path string) ([]store.Dirent, error) {

@@ -83,7 +83,10 @@ func main() {
 		cmd = exec.Command("mount.exe",
 			"-o", "anon",
 			"-o", "mtype=hard",
-			"-o", "nolock",
+			"-o", "casesensitive=yes",
+			// TODO: add "-o", "nolock" once we send a fix to cmd/go
+			// to upstream Go to not require RLock to pass on file-readonly
+			// filesystems.
 			`\\127.0.0.1\modfs`,
 			mntDir)
 	case "linux":
@@ -151,6 +154,33 @@ func main() {
 	}
 
 	log.Printf("gomodfs mounted successfully at %s; contents: %q", mntDir, names)
+
+	if e := os.Getenv("GITHUB_ENV"); e != "" {
+		mcDir := mntDir
+
+		// On Windows, ensure the path has a trailing slash
+		// and isn't just a drive letter like "Z:".
+		if runtime.GOOS == "windows" && strings.HasSuffix(mcDir, ":") {
+			mcDir += "\\"
+		}
+		err := appendFile(e, fmt.Appendf(nil, "GOMODCACHE=%s\n", mcDir), 0644)
+		if err != nil {
+			log.Fatalf("writing GOMODFS to GITHUB_ENV file %q: %v", e, err)
+		}
+		log.Printf("set env GOMODCACHE=%s", mcDir)
+	}
+}
+
+func appendFile(name string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_APPEND, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // TODO(bradfitz): de-dup these from gomodfs.go?

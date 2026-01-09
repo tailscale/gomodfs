@@ -2,8 +2,6 @@ name: Go CI
 
 on:
   push:
-    branches:
-      - "main"
   pull_request:
 
 concurrency:
@@ -102,6 +100,11 @@ jobs:
         working-directory: testdata/exoticmod
         run: |
           go env
+
+      - name: "run go mod download"
+        working-directory: testdata/exoticmod
+        run: |
+          go mod download
 
       # NFS can't handle UTF-8 filenames on Windows, so skip this step there.
       - name: "[unix] run go mod verify"

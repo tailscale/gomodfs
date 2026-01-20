@@ -85,6 +85,26 @@ var pathTests = []struct {
 	{path: "foo/bar", want: gmPath{}},
 	{path: "foo/bar/baz", want: gmPath{}},
 	{path: "foo/bar/baz", want: gmPath{}},
+
+	// https://github.com/tailscale/gomodfs/issues/17
+	{path: "github.com/go4.org/staticcheck.conf", want: gmPath{NotExist: true}},
+	{path: "github.com/go4.org/mem/staticcheck.conf", want: gmPath{NotExist: true}},
+	{
+		path: "github.com/go4.org/mem@v2.17.2/staticcheck.conf",
+		want: gmPath{
+			ModVersion: store.ModuleVersion{Module: "github.com/go4.org/mem", Version: "v2.17.2"},
+			InZip:      true,
+			Path:       "staticcheck.conf",
+		},
+	},
+	{
+		path: "github.com/go4.org/mem@v2.17.2/foo/bar/staticcheck.conf",
+		want: gmPath{
+			ModVersion: store.ModuleVersion{Module: "github.com/go4.org/mem", Version: "v2.17.2"},
+			InZip:      true,
+			Path:       "foo/bar/staticcheck.conf",
+		},
+	},
 	{
 		path: "github.com/tailscale/web-client-prebuilt@v0.0.0-20250124233751-d4cd19a26976/build/", // with trailing slash
 		want: gmPath{

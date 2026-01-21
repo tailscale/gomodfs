@@ -93,6 +93,10 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
+		if ext == "zip" {
+			// The "zip" file is unused by cmd/go, so just return an empty file.
+			return regFileInfo{name: name, size: 0}, nil
+		}
 		sp := d.fs.Stats.StartSpan("webdav.Stat-et-" + ext)
 		v, err := d.fs.getMetaFileByExt(ctx, dp.ModVersion, ext)
 		sp.End(err)

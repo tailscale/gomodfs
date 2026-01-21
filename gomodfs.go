@@ -488,6 +488,7 @@ type pathHash [sha256.Size]byte
 var (
 	cdFileInfo    = mkWellKnownPathHash("info")
 	cdFileMod     = mkWellKnownPathHash("mod")
+	cdFileZip     = mkWellKnownPathHash("zip")
 	cdFileZiphash = mkWellKnownPathHash("ziphash")
 	pathHashTSGo  = mkWellKnownPathHash(wkTSGoExtracted)
 )

@@ -27,9 +27,11 @@ type gmPath struct {
 	// are just checking for, but don't exist in the gomodfs hierarchy.
 	NotExist bool
 
-	// CacheDownloadFileExt is one of "mod", "ziphash", "info"
+	// CacheDownloadFileExt is one of "mod", "ziphash", "info", or "zip".
 	// if the path is for "cache/download/<module>/@v/<version>.<CacheDownloadFileExt>".
 	// If non-empty, then ModVersion is also populated.
+	// The file contents for the "zip" file are unused by cmd/go, so gomodfs
+	// just pretends it exists and returns an empty file.
 	CacheDownloadFileExt string
 
 	// InZip, if true, means that the path is within the contents of a zip
@@ -108,7 +110,7 @@ func parsePath(name string) (ret gmPath) {
 			return
 		}
 		switch ext {
-		case ".mod", ".ziphash", ".info":
+		case ".mod", ".ziphash", ".info", ".zip":
 			ret.CacheDownloadFileExt = ext[1:]
 		default:
 			// Not a recognized cache/download file.

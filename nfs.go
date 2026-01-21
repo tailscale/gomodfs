@@ -232,6 +232,10 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	ctx := context.TODO()
 
 	if ext := mp.CacheDownloadFileExt; ext != "" {
+		if ext == "zip" {
+			// The "zip" file is unused by cmd/go, so just return an empty file.
+			return regFileInfo{name: filepath.Base(filename), size: 0}, nil
+		}
 		v, err := b.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
 		if err != nil {
 			b.fs.logf("Failed to get %s file for %v: %v", ext, mp.ModVersion, err)
@@ -434,6 +438,8 @@ func (h *NFSHandler) fromHandle(handle handle) (ret handleTarget, err error) {
 		return mkTargetFromPath(cdPath(mv, "info")), nil
 	case cdFileMod:
 		return mkTargetFromPath(cdPath(mv, "mod")), nil
+	case cdFileZip:
+		return mkTargetFromPath(cdPath(mv, "zip")), nil
 	case cdFileZiphash:
 		return mkTargetFromPath(cdPath(mv, "ziphash")), nil
 	case pathHashTSGo:
@@ -677,6 +683,10 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 	}
 
 	if ext := mp.CacheDownloadFileExt; ext != "" {
+		if ext == "zip" {
+			// The "zip" file is unused by cmd/go, so just return an empty file.
+			return []byte{}, attr, nil
+		}
 		sp := n.fs.Stats.StartSpan("nfs.OpenFile-ext-" + ext)
 		v, err := n.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
 		sp.End(err)

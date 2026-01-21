@@ -131,16 +131,6 @@ func parsePath(name string) (ret gmPath) {
 			ret.NotExist = true
 			return
 		}
-
-		// staticcheck walks the directory, looking for staticcheck.conf and
-		// does not stop at '@' - make sure we don't tell it that there is a
-		// foo/bar/staticcheck.conf directory that it will then attempt to parse
-		// as its config file.
-		// https://github.com/tailscale/gomodfs/issues/17
-		if base == "staticcheck.conf" {
-			ret.NotExist = true
-			return
-		}
 		return
 	}
 	escVer, path, _ := strings.Cut(verAndPath, "/")

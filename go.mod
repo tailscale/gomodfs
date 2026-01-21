@@ -3,7 +3,6 @@ module github.com/tailscale/gomodfs
 go 1.25.1
 
 require (
-	github.com/aegistudio/go-winfsp v1.0.1
 	github.com/go-git/go-billy/v5 v5.6.2
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/google/go-cmp v0.7.0
@@ -13,6 +12,7 @@ require (
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
 	github.com/willscott/go-nfs v0.0.3
 	github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886
+	github.com/winfsp/go-winfsp v1.0.2
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/mod v0.26.0
 	golang.org/x/net v0.42.0

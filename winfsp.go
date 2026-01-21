@@ -18,9 +18,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aegistudio/go-winfsp"
-	"github.com/aegistudio/go-winfsp/gofs"
 	"github.com/tailscale/gomodfs/store"
+	"github.com/winfsp/go-winfsp"
+	"github.com/winfsp/go-winfsp/gofs"
 	"golang.org/x/sys/windows"
 )
 

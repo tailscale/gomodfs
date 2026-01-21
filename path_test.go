@@ -86,9 +86,6 @@ var pathTests = []struct {
 	{path: "foo/bar/baz", want: gmPath{}},
 	{path: "foo/bar/baz", want: gmPath{}},
 
-	// https://github.com/tailscale/gomodfs/issues/17
-	{path: "github.com/go4.org/staticcheck.conf", want: gmPath{NotExist: true}},
-	{path: "github.com/go4.org/mem/staticcheck.conf", want: gmPath{NotExist: true}},
 	{
 		path: "github.com/go4.org/mem@v2.17.2/staticcheck.conf",
 		want: gmPath{

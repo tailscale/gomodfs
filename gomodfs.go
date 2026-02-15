@@ -63,6 +63,10 @@ type FS struct {
 
 	Verbose bool
 
+	// ReadOnly, if true, prevents the FS from downloading modules on cache miss.
+	// When set, ErrCacheMiss is returned directly instead of attempting downloads.
+	ReadOnly bool
+
 	// FileCacheSize specifies the file cache size to use.
 	// If zero, a default size is used.
 	FileCacheSize int64
@@ -93,6 +97,9 @@ type FS struct {
 	blobCache lru.Cache[blobHash, []byte]
 	blobCount map[blobHash]int // ref count of blobHash in entCache
 }
+
+// GetStore returns the underlying store.Store.
+func (fs *FS) GetStore() store.Store { return fs.Store }
 
 func (fs *FS) GetFileCacheSize() int64 {
 	const defaultFileCacheSize = 2 << 30
@@ -379,6 +386,9 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 		if !errors.Is(err, store.ErrCacheMiss) {
 			return nil, fmt.Errorf("failed to get zip root for %v: %w", mv, err)
 		}
+		if fs.ReadOnly {
+			return nil, store.ErrCacheMiss
+		}
 
 		span := fs.Stats.StartSpan("get-zip-root-cache-fill")
 		root, err = fs.downloadZip(ctx, mv)
@@ -394,6 +404,19 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 		return nil, err
 	}
 	return rooti.(store.ModHandle), nil
+}
+
+// GetZipRootOrDownload returns a ModHandle for the given module version,
+// downloading it from the module proxy if not already cached.
+// This is an exported wrapper around getZipRoot for use by the remotestore handler.
+func (fs *FS) GetZipRootOrDownload(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
+	return fs.getZipRoot(ctx, mv)
+}
+
+// GetMetaFileByExt returns the metadata file for the given extension ("mod", "ziphash", "info"),
+// downloading it if not cached. This is an exported wrapper for use by the remotestore handler.
+func (fs *FS) GetMetaFileByExt(ctx context.Context, mv store.ModuleVersion, ext string) ([]byte, error) {
+	return fs.getMetaFileByExt(ctx, mv, ext)
 }
 
 // ext is one of "mod", "ziphash", "info".
@@ -426,6 +449,9 @@ func (fs *FS) getMetaFile(ctx context.Context, mv store.ModuleVersion, ext strin
 	}
 	if !errors.Is(err, store.ErrCacheMiss) {
 		return nil, fmt.Errorf("failed to get %s file for %v: %w", ext, mv, err)
+	}
+	if fs.ReadOnly {
+		return nil, store.ErrCacheMiss
 	}
 	v, err = downloadAndFill(ctx, mv)
 	if err != nil {

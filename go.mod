@@ -8,6 +8,7 @@ require (
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/google/go-cmp v0.7.0
 	github.com/hanwen/go-fuse/v2 v2.8.0
+	github.com/pierrec/lz4/v4 v4.1.25
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93

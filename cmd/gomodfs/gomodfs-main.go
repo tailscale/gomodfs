@@ -24,6 +24,7 @@ import (
 	"github.com/tailscale/gomodfs"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
+	"github.com/tailscale/gomodfs/store/remotestore"
 	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
 )
 
@@ -39,6 +40,9 @@ var (
 
 	// TODO: ideally auto-detect and remove this flag.
 	flagNFSForWindows = flag.Bool("nfs-for-windows-clients", runtime.GOOS == "windows", "if set, alter NFS server behavior for Windows clients (TODO: ideally auto-detect and remove this flag)")
+
+	flagRemoteStore   = flag.String("remote-store", "", "if set, use a remote HTTP store at this URL instead of local git store")
+	flagServeStoreAPI = flag.String("serve-store-api", "", "if set, serve the store API on this address (e.g. :8090)")
 )
 
 func main() {
@@ -49,19 +53,57 @@ func main() {
 		os.Exit(0)
 	})
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("os.UserHomeDir: %v", err)
-	}
-	gitCache := filepath.Join(homeDir, ".cache", "gomodfs")
-	if err := os.MkdirAll(gitCache, 0755); err != nil {
-		log.Panicf("Failed to create git cache directory %s: %v", gitCache, err)
-	}
-	cmd := exec.Command("git", "init", gitCache)
-	cmd.Dir = gitCache
-	cmd.Run() // best effort
-
 	mntDir := *flagMountPoint
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewBuildInfoCollector(),
+	)
+	st := stats.NewStatsWithRegistry(reg)
+
+	var mfs *gomodfs.FS
+
+	if *flagRemoteStore != "" {
+		// Remote store mode: use HTTP backend, no local git.
+		mfs = &gomodfs.FS{
+			Store: &remotestore.Store{
+				BaseURL: *flagRemoteStore,
+			},
+			Stats:    st,
+			Verbose:  *verbose,
+			ReadOnly: true,
+		}
+	} else {
+		// Local git store mode.
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("os.UserHomeDir: %v", err)
+		}
+		gitCache := filepath.Join(homeDir, ".cache", "gomodfs")
+		if err := os.MkdirAll(gitCache, 0755); err != nil {
+			log.Panicf("Failed to create git cache directory %s: %v", gitCache, err)
+		}
+		cmd := exec.Command("git", "init", gitCache)
+		cmd.Dir = gitCache
+		cmd.Run() // best effort
+
+		gitStore := &gitstore.Storage{
+			GitRepo: gitCache,
+			Stats:   st,
+		}
+		mfs = &gomodfs.FS{
+			Store:   gitStore,
+			Stats:   st,
+			Verbose: *verbose,
+		}
+	}
+
+	if *flagMemLimitMB != 0 {
+		mfs.FileCacheSize = *flagMemLimitMB << 20
+	}
+
 	if mntDir != "" && runtime.GOOS != "windows" {
 		exec.Command("umount", mntDir).Run() // best effort
 		if os.Getenv("GOOS") == "darwin" {
@@ -70,25 +112,6 @@ func main() {
 		if err := os.MkdirAll(mntDir, 0755); err != nil {
 			log.Panicf("Failed to create mount directory %s: %v", mntDir, err)
 		}
-	}
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		collectors.NewBuildInfoCollector(),
-	)
-	st := stats.NewStatsWithRegistry(reg)
-	gitStore := &gitstore.Storage{
-		GitRepo: gitCache,
-		Stats:   st,
-	}
-	mfs := &gomodfs.FS{
-		Store:   gitStore,
-		Stats:   st,
-		Verbose: *verbose,
-	}
-	if *flagMemLimitMB != 0 {
-		mfs.FileCacheSize = *flagMemLimitMB << 20
 	}
 
 	if *portmapper {
@@ -131,6 +154,18 @@ func main() {
 		go hs.Serve(ln)
 	}
 
+	if *flagServeStoreAPI != "" {
+		ln, err := net.Listen("tcp", *flagServeStoreAPI)
+		if err != nil {
+			log.Fatalf("Failed to listen on store API address %s: %v", *flagServeStoreAPI, err)
+		}
+		log.Printf("Store API server listening on %s", ln.Addr())
+		hs := &http.Server{
+			Handler: remotestore.Handler(mfs),
+		}
+		go hs.Serve(ln)
+	}
+
 	var nfsListenAddr net.Addr
 	if *flagNFS != "" {
 		if *verbose {
@@ -163,6 +198,7 @@ func main() {
 	}
 
 	var mount gomodfs.MountRunner
+	var err error
 	if *useWebDAV {
 		mount, err = mfs.MountWebDAV(mntDir, &gomodfs.MountOpts{
 			Debug: *verbose,

@@ -38,6 +38,7 @@ func (f *FS) MountFUSE(mntPoint string, opt *MountOpts) (MountRunner, error) {
 			Debug:         opt.Debug,
 			FsName:        "gomodfs",
 			DisableXAttrs: true,
+			Options:       []string{"ro"},
 		},
 	}
 

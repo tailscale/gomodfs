@@ -168,7 +168,8 @@ func (pfs *fspFS) Stat(name string) (fi os.FileInfo, retErr error) {
 		if dp.WellKnown == statusFile {
 			return statusStat, nil
 		}
-		return regFileInfo{name: name, size: 123}, nil
+		trip, _ := isTSGoModule(dp.ModVersion)
+		return regFileInfo{name: name, size: int64(len(tsgoExtractedFileContents(trip.Hash)))}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
 		sp := d.fs.Stats.StartSpan("fsp.Stat-et-" + ext)
@@ -263,7 +264,8 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 		case statusFile:
 			return newFWPFileFromContents(base, pfs.fs.StatusJSON()), nil
 		case wkTSGoExtracted:
-			return newFWPFileFromContents(base, nil), nil
+			trip, _ := isTSGoModule(dp.ModVersion)
+			return newFWPFileFromContents(base, tsgoExtractedFileContents(trip.Hash)), nil
 		}
 		return nil, os.ErrNotExist
 	}

@@ -219,9 +219,10 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 		m := b.h.statusFile()
 		return m.fi, nil
 	case wkTSGoExtracted:
+		trip, _ := isTSGoModule(mp.ModVersion)
 		return regFileInfo{
-			name:       "TODO-tsgo-hash.extracted", // TODO(bradfitz): does it matter?
-			size:       0,                          // empty file
+			name:       path.Base(filename),
+			size:       int64(len(tsgoExtractedFileContents(trip.Hash))),
 			mode:       0444,
 			modTimeNow: true,
 		}, nil
@@ -667,7 +668,8 @@ func (n *NFSHandler) getFileContentsUncached(ctx context.Context, filename strin
 	case "":
 		// nothing
 	case wkTSGoExtracted:
-		return nil, attr, nil
+		trip, _ := isTSGoModule(mp.ModVersion)
+		return tsgoExtractedFileContents(trip.Hash), attr, nil
 	case statusFile:
 		m := n.statusFile()
 		setNFSTime(attr, m.fi.ModTime())

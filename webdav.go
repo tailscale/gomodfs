@@ -90,6 +90,10 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return nil, os.ErrNotExist
 	}
 	if dp.WellKnown != "" {
+		if dp.WellKnown == wkTSGoExtracted {
+			trip, _ := isTSGoModule(dp.ModVersion)
+			return regFileInfo{name: name, size: int64(len(tsgoExtractedFileContents(trip.Hash)))}, nil
+		}
 		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
@@ -172,7 +176,8 @@ func (d webdavFS) OpenFile(ctx context.Context, name string, flag int, perm os.F
 		case statusFile:
 			return newWDFileFromContents(base, d.fs.StatusJSON()), nil
 		case wkTSGoExtracted:
-			return newWDFileFromContents(base, nil), nil
+			trip, _ := isTSGoModule(dp.ModVersion)
+			return newWDFileFromContents(base, tsgoExtractedFileContents(trip.Hash)), nil
 		}
 		return nil, os.ErrNotExist
 	}

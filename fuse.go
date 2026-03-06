@@ -623,7 +623,7 @@ func (f *statusFileNode) Getattr(_ context.Context, h fs.FileHandle, out *fuse.A
 // It pretends to the GOOS as given by the "goos" and "goarch" fields.
 //
 // It can contain two types of entries:
-//  1. ${git-hash}.extracted empty file
+//  1. ${git-hash}.extracted file containing the git hash and a newline
 //  2. ${git-hash}/ directory of contents
 //
 // Where git-hash is the hash of a github.com/tailscale/go
@@ -660,9 +660,8 @@ func (n *tsgoRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	setLongTTL(out)
 
 	if wantExtractedFile {
-		// If it's a file, it must be an empty file.
 		in := n.NewInode(ctx, &memFile{
-			contents: []byte{},
+			contents: tsgoExtractedFileContents(hash),
 			mode:     0644,
 		}, fs.StableAttr{
 			Mode: fuse.S_IFREG | 0644,

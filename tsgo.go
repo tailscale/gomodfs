@@ -24,6 +24,12 @@ var (
 
 const wkTSGoExtracted = "tsgo.extracted"
 
+// tsgoExtractedFileContents returns the contents of a
+// ${git-hash}.extracted file, which is the hash followed by a newline.
+func tsgoExtractedFileContents(hash string) []byte {
+	return fmt.Appendf(nil, "%s\n", hash)
+}
+
 func validTSGoOSARCH(goos, goarch string) bool {
 	// Keep this in sync with above.
 	switch goos {

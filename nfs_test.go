@@ -276,7 +276,7 @@ func TestNFSHandles(t *testing.T) {
 	})
 
 	wantRegSize(t, h1, "go4.org@v0.0.0-20230225012048-214862532bf5/media/heif/heif.go", 7434)
-	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09.extracted", 0)
+	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09.extracted", 41)
 	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/README", 3)
 	wantRegSize(t, h1, "tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/bin/gofmt", 49)
 	wantRegSize(t, h1, "github.com/!azure/azure-sdk-for-go/sdk/azcore@v1.11.0/arm/runtime/policy_trace_namespace_test.go", 3215)

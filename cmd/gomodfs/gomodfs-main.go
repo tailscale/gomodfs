@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/bradfitz/parentdeath"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -42,6 +43,11 @@ var (
 
 func main() {
 	flag.Parse()
+
+	parentdeath.Monitor(func() {
+		log.Printf("gomodfs: parent process died, exiting")
+		os.Exit(0)
+	})
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {

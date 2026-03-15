@@ -3,6 +3,7 @@ module github.com/tailscale/gomodfs
 go 1.25.1
 
 require (
+	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
 	github.com/go-git/go-billy/v5 v5.6.2
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/google/go-cmp v0.7.0

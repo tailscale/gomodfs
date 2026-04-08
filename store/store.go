@@ -49,6 +49,10 @@ type Store interface {
 	// path is "" for root, else "foo" or "foo/bar" (no trailing slash)
 	Readdir(ctx context.Context, h ModHandle, path string) ([]Dirent, error)
 
+	// GetZipFileEntries returns metadata for all files in the module's zip,
+	// sufficient to construct a synthetic zip archive without reading file contents.
+	GetZipFileEntries(ctx context.Context, h ModHandle) ([]ZipFileEntry, error)
+
 	// PutModule populates the store with the given module version data
 	// when ErrCacheMiss is returned.
 	PutModule(context.Context, ModuleVersion, PutModuleData) (ModHandle, error)
@@ -71,6 +75,7 @@ type PutFile interface {
 	Path() string
 	Mode() fs.FileMode // only 0644 or 0755 are valid
 	Size() int64       // size of the file in bytes
+	CRC32() uint32     // CRC-32 checksum (IEEE polynomial) of the file content
 	Open() (io.ReadCloser, error)
 }
 
@@ -78,6 +83,13 @@ type Dirent struct {
 	Name string      // bare name, no slashes
 	Mode fs.FileMode // can be 0644 or 0 (regular files), 0755 (executable files), or fs.ModeDir; no symlinks
 	Size int64       // for regular files
+}
+
+// ZipFileEntry describes a file within a module's zip for synthetic zip construction.
+type ZipFileEntry struct {
+	Path  string // path within zip, relative to module root (e.g. "go.mod")
+	Size  int64
+	CRC32 uint32
 }
 
 type ModuleVersion struct {

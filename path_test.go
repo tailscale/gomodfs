@@ -37,6 +37,13 @@ var pathTests = []struct {
 		},
 	},
 	{
+		path: "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.zip",
+		want: gmPath{
+			CacheDownloadFileExt: "zip",
+			ModVersion:           store.ModuleVersion{Module: "go4.org/mem", Version: "v0.0.0-20240501181205-ae6ca9944745"},
+		},
+	},
+	{
 		path: "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.bogusext",
 		want: gmPath{NotExist: true},
 	},

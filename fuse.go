@@ -529,8 +529,8 @@ func (n *cacheDownloadNode) lookupUnderModule(ctx context.Context, name string, 
 
 	dotExt := filepath.Ext(name)
 	switch dotExt {
-	case ".info", ".mod", ".ziphash":
-		ext := dotExt[1:] // "info", "mod", "ziphash"
+	case ".info", ".mod", ".ziphash", ".zip":
+		ext := dotExt[1:] // "info", "mod", "ziphash", "zip"
 
 		sp := n.fs.Stats.StartSpan("get-metafile-" + ext)
 		defer func() {

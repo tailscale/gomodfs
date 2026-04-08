@@ -108,7 +108,7 @@ func parsePath(name string) (ret gmPath) {
 			return
 		}
 		switch ext {
-		case ".mod", ".ziphash", ".info":
+		case ".mod", ".ziphash", ".info", ".zip":
 			ret.CacheDownloadFileExt = ext[1:]
 		default:
 			// Not a recognized cache/download file.

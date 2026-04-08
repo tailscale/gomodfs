@@ -5,6 +5,7 @@ package gomodfs
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -252,6 +253,7 @@ func TestNFSHandles(t *testing.T) {
 		"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.info",
 		"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.mod",
 		"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.ziphash",
+		"cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.zip",
 		"tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09.extracted",
 		"tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/fake.bash",
 		"tsgo-linux-amd64/1cd3bf1a6eaf559aa8c00e749289559c884cef09/bin/gofmt",
@@ -299,6 +301,78 @@ func TestNFSHandles(t *testing.T) {
 		if gotPath != path {
 			t.Errorf("FromHandle(handle of %q) didn't round trip; went to %q instead", path, gotPath)
 		}
+	}
+}
+
+func TestZipFile(t *testing.T) {
+	gitCacheDir := testGitDir(t)
+	h := testNFSHandler(t, gitCacheDir)
+
+	// Trigger download of the go4.org/mem module.
+	wantRegSize(t, h, "go4.org/mem@v0.0.0-20240501181205-ae6ca9944745/LICENSE", 11358)
+
+	// Read the synthetic .zip file.
+	zipPath := "cache/download/go4.org/mem/@v/v0.0.0-20240501181205-ae6ca9944745.zip"
+	ctx := context.Background()
+	data, _, err := h.getFileContentsUncached(ctx, zipPath)
+	if err != nil {
+		t.Fatalf("getFileContentsUncached(%q): %v", zipPath, err)
+	}
+	if len(data) == 0 {
+		t.Fatal("zip file is empty")
+	}
+
+	// Verify it's a valid zip archive.
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("zip.NewReader: %v", err)
+	}
+
+	// Verify files are present and match individually-cached content.
+	const mod = "go4.org/mem"
+	const ver = "v0.0.0-20240501181205-ae6ca9944745"
+	prefix := mod + "@" + ver + "/"
+
+	for _, zf := range zr.File {
+		if !strings.HasPrefix(zf.Name, prefix) {
+			t.Errorf("zip entry %q doesn't start with expected prefix %q", zf.Name, prefix)
+			continue
+		}
+		relPath := strings.TrimPrefix(zf.Name, prefix)
+
+		// Read from zip.
+		rc, err := zf.Open()
+		if err != nil {
+			t.Errorf("open zip entry %q: %v", zf.Name, err)
+			continue
+		}
+		zipContent, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Errorf("read zip entry %q: %v", zf.Name, err)
+			continue
+		}
+
+		// Read from store.
+		storePath := mod + "@" + ver + "/" + relPath
+		storeData, _, err := h.getFileContentsUncached(ctx, storePath)
+		if err != nil {
+			t.Errorf("getFileContentsUncached(%q): %v", storePath, err)
+			continue
+		}
+
+		if !bytes.Equal(zipContent, storeData) {
+			t.Errorf("content mismatch for %q: zip has %d bytes, store has %d bytes", relPath, len(zipContent), len(storeData))
+		}
+	}
+
+	// Verify stat returns the correct size.
+	fi, err := h.billyFS().Lstat(zipPath)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", zipPath, err)
+	}
+	if fi.Size() != int64(len(data)) {
+		t.Errorf("Lstat size = %d; want %d", fi.Size(), len(data))
 	}
 }
 

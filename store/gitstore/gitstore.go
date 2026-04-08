@@ -677,9 +677,10 @@ type modHandle struct {
 
 // blobMeta is the metadata for a blob in a tree.
 type blobMeta struct {
-	Blob objRef
-	Size int64
-	Mode os.FileMode
+	Blob  objRef
+	Size  int64
+	Mode  os.FileMode
+	CRC32 uint32 // CRC-32 checksum; 0 if not known (old cache entries)
 }
 
 func (s *Storage) GetFile(ctx context.Context, h store.ModHandle, path string) ([]byte, error) {
@@ -955,7 +956,48 @@ func (s *Storage) newModHandle(mv store.ModuleVersion, modTree objRef) (store.Mo
 		}
 		mh.dirEnts[dir] = append(mh.dirEnts[dir], ent)
 	}
+
+	// Try to load CRC32 data from the zipcrc blob.
+	if crcObj, err := s.getObject(context.TODO(), modTree.String()+":zipcrc", "blob"); err == nil {
+		for line := range bytes.Lines(crcObj.content) {
+			line = bytes.TrimRight(line, "\n")
+			if len(line) == 0 {
+				continue
+			}
+			hexCRC, filePath, ok := bytes.Cut(line, []byte("\t"))
+			if !ok || len(hexCRC) != 8 {
+				continue
+			}
+			crc, err := strconv.ParseUint(string(hexCRC), 16, 32)
+			if err != nil {
+				continue
+			}
+			p := string(filePath)
+			if bm, ok := mh.blobMeta[p]; ok {
+				bm.CRC32 = uint32(crc)
+				mh.blobMeta[p] = bm
+			}
+		}
+	}
+	// If zipcrc doesn't exist (old cache entries), CRC32 fields stay 0.
+
 	return mh, nil
+}
+
+func (s *Storage) GetZipFileEntries(_ context.Context, h store.ModHandle) ([]store.ZipFileEntry, error) {
+	mh := h.(*modHandle)
+	entries := make([]store.ZipFileEntry, 0, len(mh.blobMeta))
+	for p, bm := range mh.blobMeta {
+		entries = append(entries, store.ZipFileEntry{
+			Path:  p,
+			Size:  bm.Size,
+			CRC32: bm.CRC32,
+		})
+	}
+	slices.SortFunc(entries, func(a, b store.ZipFileEntry) int {
+		return cmp.Compare(a.Path, b.Path)
+	})
+	return entries, nil
 }
 
 func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, error) {
@@ -995,6 +1037,26 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 			return nil, fmt.Errorf("failed to add %s file: %w", ext, err)
 		}
 	}
+	// Build the zipcrc blob: one line per file, sorted by path.
+	// Format: "<8-hex-crc32>\t<path>\n"
+	var hasCRC bool
+	for _, f := range data.Files {
+		if f.CRC32() != 0 {
+			hasCRC = true
+			break
+		}
+	}
+	if hasCRC {
+		var crcBuf bytes.Buffer
+		for _, f := range data.Files {
+			fmt.Fprintf(&crcBuf, "%08x\t%s\n", f.CRC32(), f.Path())
+		}
+		crcData := crcBuf.Bytes()
+		if err := tb.addFile("zipcrc", static(crcData), 0644); err != nil {
+			return nil, fmt.Errorf("failed to add zipcrc file: %w", err)
+		}
+	}
+
 	for _, f := range data.Files {
 		if err := tb.addFile("zip/"+f.Path(), f.Open, f.Mode()); err != nil {
 			return nil, fmt.Errorf("failed to add zip file %q: %w", f.Path(), err)

@@ -56,6 +56,7 @@ type tsgoFile struct {
 
 func (f tsgoFile) Path() string                 { return f.path }
 func (f tsgoFile) Size() int64                  { return int64(len(f.content)) }
+func (f tsgoFile) CRC32() uint32                { return 0 } // not used for tsgo
 func (f tsgoFile) Open() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(f.content)), nil }
 func (f tsgoFile) Mode() os.FileMode            { return f.mode }
 

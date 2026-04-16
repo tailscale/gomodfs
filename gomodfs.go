@@ -34,6 +34,7 @@ import (
 	"github.com/tailscale/gomodfs/internal/lru"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store"
+	"github.com/tomhjp/synthzip"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
@@ -396,7 +397,7 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 	return rooti.(store.ModHandle), nil
 }
 
-// ext is one of "mod", "ziphash", "info".
+// ext is one of "mod", "ziphash", "info", "zip".
 func (fs *FS) getMetaFileByExt(ctx context.Context, mv store.ModuleVersion, ext string) ([]byte, error) {
 	switch ext {
 	case "mod":
@@ -405,6 +406,8 @@ func (fs *FS) getMetaFileByExt(ctx context.Context, mv store.ModuleVersion, ext 
 		return fs.getZiphash(ctx, mv)
 	case "info":
 		return fs.getInfoFile(ctx, mv)
+	case "zip":
+		return fs.getZipFileData(ctx, mv)
 	}
 	return nil, fmt.Errorf("unknown meta file extension %q", ext)
 }
@@ -442,6 +445,63 @@ func (fs *FS) getZiphash(ctx context.Context, mv store.ModuleVersion) (data []by
 		return nil, err
 	}
 	return fs.Store.GetZipHash(ctx, zr)
+}
+
+// getZipArchive returns a synthetic zip archive for the given module version.
+// The returned archive is cheap to construct (metadata only) and supports ReadAt
+// for lazy content loading.
+func (fs *FS) getZipArchive(ctx context.Context, mv store.ModuleVersion) (*synthzip.Archive, error) {
+	mh, err := fs.getZipRoot(ctx, mv)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := fs.Store.GetZipFileEntries(ctx, mh)
+	if err != nil {
+		return nil, fmt.Errorf("GetZipFileEntries for %v: %w", mv, err)
+	}
+
+	// Module zip files have paths like "module@version/path".
+	prefix := mv.Module + "@" + mv.Version + "/"
+
+	files := make([]synthzip.File, len(entries))
+	for i, e := range entries {
+		files[i] = synthzip.File{
+			Name: prefix + e.Path,
+			Size: e.Size,
+		}
+	}
+
+	return synthzip.New(files, func(name string) (io.ReadCloser, error) {
+		// Strip the module@version/ prefix to get the store path.
+		p := strings.TrimPrefix(name, prefix)
+		data, err := fs.Store.GetFile(ctx, mh, p)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	})
+}
+
+// getZipFileData returns the full zip file bytes for the given module version.
+func (fs *FS) getZipFileData(ctx context.Context, mv store.ModuleVersion) ([]byte, error) {
+	archive, err := fs.getZipArchive(ctx, mv)
+	if err != nil {
+		return nil, err
+	}
+	data := make([]byte, archive.Size())
+	if _, err := archive.ReadAt(data, 0); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("reading zip archive for %v: %w", mv, err)
+	}
+	return data, nil
+}
+
+// getZipFileSize returns the size of the synthetic zip file without reading content.
+func (fs *FS) getZipFileSize(ctx context.Context, mv store.ModuleVersion) (int64, error) {
+	archive, err := fs.getZipArchive(ctx, mv)
+	if err != nil {
+		return 0, err
+	}
+	return archive.Size(), nil
 }
 
 func (fs *FS) walkStoreModulePaths(ctx context.Context, mh store.ModHandle) iter.Seq[result.Of[string]] {
@@ -489,6 +549,7 @@ var (
 	cdFileInfo    = mkWellKnownPathHash("info")
 	cdFileMod     = mkWellKnownPathHash("mod")
 	cdFileZiphash = mkWellKnownPathHash("ziphash")
+	cdFileZip     = mkWellKnownPathHash("zip")
 	pathHashTSGo  = mkWellKnownPathHash(wkTSGoExtracted)
 )
 

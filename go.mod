@@ -11,6 +11,7 @@ require (
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
+	github.com/tomhjp/synthzip v0.2.0
 	github.com/willscott/go-nfs v0.0.3
 	github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886
 	github.com/winfsp/go-winfsp v1.0.2

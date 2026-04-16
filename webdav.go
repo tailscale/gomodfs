@@ -97,6 +97,16 @@ func (d webdavFS) Stat(ctx context.Context, name string) (fi os.FileInfo, retErr
 		return regFileInfo{name: name, size: 123}, nil
 	}
 	if ext := dp.CacheDownloadFileExt; ext != "" {
+		if ext == "zip" {
+			sp := d.fs.Stats.StartSpan("webdav.Stat-et-zip")
+			size, err := d.fs.getZipFileSize(ctx, dp.ModVersion)
+			sp.End(err)
+			if err != nil {
+				log.Printf("Failed to get zip size for %v: %v", dp.ModVersion, err)
+				return nil, syscall.EIO
+			}
+			return regFileInfo{name: name, size: size}, nil
+		}
 		sp := d.fs.Stats.StartSpan("webdav.Stat-et-" + ext)
 		v, err := d.fs.getMetaFileByExt(ctx, dp.ModVersion, ext)
 		sp.End(err)

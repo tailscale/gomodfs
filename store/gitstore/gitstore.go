@@ -955,7 +955,23 @@ func (s *Storage) newModHandle(mv store.ModuleVersion, modTree objRef) (store.Mo
 		}
 		mh.dirEnts[dir] = append(mh.dirEnts[dir], ent)
 	}
+
 	return mh, nil
+}
+
+func (s *Storage) GetZipFileEntries(_ context.Context, h store.ModHandle) ([]store.ZipFileEntry, error) {
+	mh := h.(*modHandle)
+	entries := make([]store.ZipFileEntry, 0, len(mh.blobMeta))
+	for p, bm := range mh.blobMeta {
+		entries = append(entries, store.ZipFileEntry{
+			Path: p,
+			Size: bm.Size,
+		})
+	}
+	slices.SortFunc(entries, func(a, b store.ZipFileEntry) int {
+		return cmp.Compare(a.Path, b.Path)
+	})
+	return entries, nil
 }
 
 func (s *Storage) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, error) {
@@ -995,6 +1011,7 @@ func (s *Storage) PutModule(ctx context.Context, mv store.ModuleVersion, data st
 			return nil, fmt.Errorf("failed to add %s file: %w", ext, err)
 		}
 	}
+
 	for _, f := range data.Files {
 		if err := tb.addFile("zip/"+f.Path(), f.Open, f.Mode()); err != nil {
 			return nil, fmt.Errorf("failed to add zip file %q: %w", f.Path(), err)

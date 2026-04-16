@@ -233,6 +233,15 @@ func (b billyFS) Lstat(filename string) (os.FileInfo, error) {
 	ctx := context.TODO()
 
 	if ext := mp.CacheDownloadFileExt; ext != "" {
+		if ext == "zip" {
+			// Avoid materializing the entire zip just for stat.
+			size, err := b.fs.getZipFileSize(ctx, mp.ModVersion)
+			if err != nil {
+				b.fs.logf("Failed to get zip size for %v: %v", mp.ModVersion, err)
+				return nil, syscall.EIO
+			}
+			return regFileInfo{name: filepath.Base(filename), size: size}, nil
+		}
 		v, err := b.fs.getMetaFileByExt(ctx, mp.ModVersion, ext)
 		if err != nil {
 			b.fs.logf("Failed to get %s file for %v: %v", ext, mp.ModVersion, err)
@@ -437,6 +446,8 @@ func (h *NFSHandler) fromHandle(handle handle) (ret handleTarget, err error) {
 		return mkTargetFromPath(cdPath(mv, "mod")), nil
 	case cdFileZiphash:
 		return mkTargetFromPath(cdPath(mv, "ziphash")), nil
+	case cdFileZip:
+		return mkTargetFromPath(cdPath(mv, "zip")), nil
 	case pathHashTSGo:
 		if trip, ok := isTSGoModule(mv); ok {
 			return mkTargetFromPath(tsGoZipRoot(trip) + ".extracted"), nil

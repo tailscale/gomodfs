@@ -57,7 +57,15 @@ type FS struct {
 	// ModuleProxyURL is the URL of the Go module proxy to use.
 	// If empty, "https://proxy.golang.org" is used.
 	// It should not have a trailing slash.
+	// It is ignored if ModuleProxyURLs is non-empty.
 	ModuleProxyURL string
+
+	// ModuleProxyURLs optionally specifies an ordered list of Go
+	// module proxy URLs. Each download is attempted against each
+	// proxy in order, moving on to the next after any error, whether
+	// a network error or a non-200 HTTP status. The URLs should not
+	// have trailing slashes. If empty, ModuleProxyURL is used.
+	ModuleProxyURLs []string
 
 	Logf func(format string, args ...any) // if non-nil, alternate logger to use
 
@@ -117,74 +125,77 @@ func (fs *FS) client() *http.Client {
 	return cmp.Or(fs.Client, http.DefaultClient)
 }
 
-func (fs *FS) moduleProxyURL() string {
-	if fs.ModuleProxyURL != "" {
-		return strings.TrimSuffix(fs.ModuleProxyURL, "/")
+func (fs *FS) moduleProxyURLs() []string {
+	if len(fs.ModuleProxyURLs) > 0 {
+		urls := make([]string, len(fs.ModuleProxyURLs))
+		for i, u := range fs.ModuleProxyURLs {
+			urls[i] = strings.TrimSuffix(u, "/")
+		}
+		return urls
 	}
-	return "https://proxy.golang.org"
+	if fs.ModuleProxyURL != "" {
+		return []string{strings.TrimSuffix(fs.ModuleProxyURL, "/")}
+	}
+	return []string{"https://proxy.golang.org"}
 }
 
-func (fs *FS) modURLBase(mv store.ModuleVersion) (string, error) {
+// modURLBases returns the "<proxy>/<module>/@v/<version>" URL prefix
+// of the given module version for each configured module proxy, in
+// the order they should be tried.
+func (fs *FS) modURLBases(mv store.ModuleVersion) ([]string, error) {
 	escMod, err := module.EscapePath(mv.Module)
 	if err != nil {
-		return "", fmt.Errorf("failed to escape module name %q: %w", mv.Module, err)
+		return nil, fmt.Errorf("failed to escape module name %q: %w", mv.Module, err)
 	}
 	escVer, err := module.EscapeVersion(mv.Version)
 	if err != nil {
-		return "", fmt.Errorf("failed to escape version %q: %w", mv.Version, err)
+		return nil, fmt.Errorf("failed to escape version %q: %w", mv.Version, err)
 	}
-	return fs.moduleProxyURL() + "/" + escMod + "/@v/" + escVer, nil
+	proxies := fs.moduleProxyURLs()
+	bases := make([]string, len(proxies))
+	for i, p := range proxies {
+		bases[i] = p + "/" + escMod + "/@v/" + escVer
+	}
+	return bases, nil
 }
 
-func (fs *FS) downloadModFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
-	sp := fs.Stats.StartSpan("download-mod-file")
+func (fs *FS) downloadModFile(ctx context.Context, mv store.ModuleVersion) ([]byte, error) {
+	return fs.downloadMetaFile(ctx, mv, "mod", fs.Store.PutModFile)
+}
+
+func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) ([]byte, error) {
+	return fs.downloadMetaFile(ctx, mv, "info", fs.Store.PutInfoFile)
+}
+
+// downloadMetaFile downloads the ".mod" or ".info" file (per ext) of
+// the given module version from the first configured module proxy
+// that can serve it and stores it with put.
+func (fs *FS) downloadMetaFile(ctx context.Context, mv store.ModuleVersion, ext string, put func(context.Context, store.ModuleVersion, []byte) error) (_ []byte, err error) {
+	sp := fs.Stats.StartSpan("download-" + ext + "-file")
 	defer func() { sp.End(err) }()
 
 	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
 
-	vi, err, _ := fs.sf.Do("download-mod:"+mv.Module+"@"+mv.Version, func() (any, error) {
-		urlBase, err := fs.modURLBase(mv)
+	vi, err, _ := fs.sf.Do("download-"+ext+":"+mv.Module+"@"+mv.Version, func() (any, error) {
+		urlBases, err := fs.modURLBases(mv)
 		if err != nil {
 			return nil, err
 		}
-		urlStr := urlBase + ".mod"
+		var errs []error
+		for _, urlBase := range urlBases {
+			urlStr := urlBase + "." + ext
 
-		data, err := fs.netSlurp(ctx, urlStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+			data, err := fs.netSlurp(ctx, urlStr)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("failed to download %q: %w", urlStr, err))
+				continue
+			}
+			if err := put(ctx, mv, data); err != nil {
+				return nil, fmt.Errorf("failed to store %s file for %q: %w", ext, mv, err)
+			}
+			return data, nil
 		}
-		if err := fs.Store.PutModFile(ctx, mv, data); err != nil {
-			return nil, fmt.Errorf("failed to store mod file for %q: %w", mv, err)
-		}
-		return data, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return vi.([]byte), nil
-}
-
-func (fs *FS) downloadInfoFile(ctx context.Context, mv store.ModuleVersion) (_ []byte, err error) {
-	sp := fs.Stats.StartSpan("download-info-file")
-	defer func() { sp.End(err) }()
-
-	ctx = context.Background() // TODO(bradfitz): make a singleflight variant that refcounts context lifetime
-
-	vi, err, _ := fs.sf.Do("download-info:"+mv.Module+"@"+mv.Version, func() (any, error) {
-		urlBase, err := fs.modURLBase(mv)
-		if err != nil {
-			return nil, err
-		}
-		urlStr := urlBase + ".info"
-
-		data, err := fs.netSlurp(ctx, urlStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
-		}
-		if err := fs.Store.PutInfoFile(ctx, mv, data); err != nil {
-			return nil, fmt.Errorf("failed to store info file for %q: %w", mv, err)
-		}
-		return data, nil
+		return nil, errors.Join(errs...)
 	})
 	if err != nil {
 		return nil, err
@@ -208,21 +219,26 @@ func (fs *FS) logf(format string, arg ...any) {
 }
 
 func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.ModHandle, error) {
-	baseURL, err := fs.modURLBase(mv)
+	baseURLs, err := fs.modURLBases(mv)
 	if err != nil {
 		return nil, err
 	}
 
-	download := map[string][]byte{} // extension (zip, info, mod) -> data
-	for _, ext := range []string{"zip", "info", "mod"} {
-		urlStr := baseURL + "." + ext
-		sp := fs.Stats.StartSpan("net-downloadZip-ext-" + ext)
-		data, err := fs.netSlurp(ctx, urlStr)
-		sp.End(err)
+	// A module version's zip, info, and mod files must all come from
+	// the same proxy, so any error moves the whole set to the next
+	// proxy rather than mixing sources.
+	var download map[string][]byte // extension (zip, info, mod) -> data
+	var errs []error
+	for _, baseURL := range baseURLs {
+		download, err = fs.downloadZipSet(ctx, baseURL)
 		if err != nil {
-			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+			errs = append(errs, err)
+			continue
 		}
-		download[ext] = data
+		break
+	}
+	if download == nil {
+		return nil, errors.Join(errs...)
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(download["zip"]), int64(len(download["zip"])))
@@ -263,6 +279,23 @@ func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.Mo
 	}
 
 	return fs.Store.PutModule(ctx, mv, put)
+}
+
+// downloadZipSet downloads a module version's zip, info, and mod
+// files from the module proxy URL prefix baseURL.
+func (fs *FS) downloadZipSet(ctx context.Context, baseURL string) (map[string][]byte, error) {
+	download := map[string][]byte{} // extension (zip, info, mod) -> data
+	for _, ext := range []string{"zip", "info", "mod"} {
+		urlStr := baseURL + "." + ext
+		sp := fs.Stats.StartSpan("net-downloadZip-ext-" + ext)
+		data, err := fs.netSlurp(ctx, urlStr)
+		sp.End(err)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %q: %w", urlStr, err)
+		}
+		download[ext] = data
+	}
+	return download, nil
 }
 
 type putFile struct {

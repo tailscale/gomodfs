@@ -76,6 +76,14 @@ jobs:
         run: |
           go run ./testing/nfsmount
 
+      - name: "mount repository NFS"
+        run: |
+          go run ./testing/nfsmount -repo-export-file=gomodfs-repo-export
+
+      - name: "verify repository mount"
+        run: |
+          go test -v ./testing/ci -repository-mount
+
       - name: "[unix] list GOMODCACHE directory"
         if: runner.os == 'Linux' || runner.os == 'macOS'
         run: |

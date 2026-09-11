@@ -1,14 +1,12 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The startgomodfs binary is used in CI tests to start a gomodfs server on
-// Windows, because Powershell-in-YAML-in-Github-Actions with shell quoting
-// is hard. But then for consistency it also does Linux & macOS, even though
-// those are trivial from YAML.
+// Mount commands live here because shell quoting across CI platforms is hard.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -21,8 +19,23 @@ import (
 )
 
 func main() {
+	repoExportFile := flag.String("repo-export-file", "", "file containing a repository export path to mount instead of the module cache")
+	flag.Parse()
 	if os.Getenv("CI") != "true" {
-		log.Fatalf("startgomodfs is only intended to be run in CI")
+		log.Fatalf("nfsmount is only intended to be run in CI")
+	}
+
+	export, mountName, envName := "/gomodfs", "gomodfs-mnt", "GOMODCACHE"
+	if *repoExportFile != "" {
+		b, err := os.ReadFile(*repoExportFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		export = strings.TrimSpace(string(b))
+		if !strings.HasPrefix(export, "/repos/") {
+			log.Fatalf("invalid repository export %q", export)
+		}
+		mountName, envName = "gomodfs-repo-mnt", "GOMODFS_REPO"
 	}
 
 	var cmd *exec.Cmd
@@ -30,7 +43,7 @@ func main() {
 	var machineIP = "127.0.0.1"
 
 	useTempMnt := func() {
-		mntDir = filepath.Join(os.TempDir(), "gomodfs-mnt")
+		mntDir = filepath.Join(os.TempDir(), mountName)
 		if err := os.MkdirAll(mntDir, 0755); err != nil {
 			log.Fatalf("creating mount dir %s: %v", mntDir, err)
 		}
@@ -80,6 +93,9 @@ func main() {
 	switch runtime.GOOS {
 	case "windows":
 		mntDir = "Z:"
+		if *repoExportFile != "" {
+			mntDir = "Y:"
+		}
 		cmd = exec.Command("mount.exe",
 			"-o", "anon",
 			"-o", "mtype=hard",
@@ -87,14 +103,14 @@ func main() {
 			// TODO: add "-o", "nolock" once we send a fix to cmd/go
 			// to upstream Go to not require RLock to pass on file-readonly
 			// filesystems.
-			`\\127.0.0.1\modfs`,
+			`\\127.0.0.1`+strings.ReplaceAll(export, "/", `\`),
 			mntDir)
 	case "linux":
 		useTempMnt()
 		cmd = exec.Command("sudo", "/usr/bin/mount",
 			"-t", "nfs",
 			"-o", linuxNFSMountOpts(2049),
-			machineIP+":/gomodfs",
+			machineIP+":"+export,
 			mntDir,
 		)
 	case "darwin":
@@ -102,7 +118,7 @@ func main() {
 		cmd = exec.Command("/sbin/mount",
 			"-t", "nfs",
 			"-o", darwinNFSMountOpts(2049),
-			machineIP+":/gomodfs",
+			machineIP+":"+export,
 			mntDir,
 		)
 	default:
@@ -163,11 +179,15 @@ func main() {
 		if runtime.GOOS == "windows" && strings.HasSuffix(mcDir, ":") {
 			mcDir += "\\"
 		}
-		err := appendFile(e, fmt.Appendf(nil, "GOMODCACHE=%s\n", mcDir), 0644)
-		if err != nil {
-			log.Fatalf("writing GOMODFS to GITHUB_ENV file %q: %v", e, err)
+		data := fmt.Appendf(nil, "%s=%s\n", envName, mcDir)
+		if *repoExportFile != "" {
+			data = fmt.Appendf(data, "GOMODFS_REPO_COMMIT=%s\n", filepath.Base(export))
 		}
-		log.Printf("set env GOMODCACHE=%s", mcDir)
+		err := appendFile(e, data, 0644)
+		if err != nil {
+			log.Fatalf("writing %s to GITHUB_ENV file %q: %v", envName, e, err)
+		}
+		log.Printf("set env %s=%s", envName, mcDir)
 	}
 }
 

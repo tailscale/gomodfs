@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"syscall"
@@ -51,6 +52,25 @@ func main() {
 		if runtime.GOOS == "windows" {
 			cmd.Args = append(cmd.Args, "-portmapper")
 		}
+	}
+
+	if !*useWinFSP {
+		dir, err := os.MkdirTemp("", "gomodfs-repo-fixture-")
+		if err != nil {
+			log.Fatal(err)
+		}
+		repoDir := filepath.Join(dir, "example", "repo")
+		if err := os.MkdirAll(repoDir, 0755); err != nil {
+			log.Fatal(err)
+		}
+		commit, err := createRepoFixture(repoDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := os.WriteFile("gomodfs-repo-export", []byte("/repos/example/repo/"+commit), 0644); err != nil {
+			log.Fatal(err)
+		}
+		cmd.Args = append(cmd.Args, "-repo=file://"+filepath.ToSlash(repoDir), "-commit="+commit)
 	}
 
 	cmd.Stdout = f

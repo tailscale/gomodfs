@@ -7,21 +7,27 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/bradfitz/parentdeath"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tailscale/gomodfs"
+	"github.com/tailscale/gomodfs/gitrepo"
+	"github.com/tailscale/gomodfs/nfsexports"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
 	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
@@ -34,12 +40,27 @@ var (
 	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
 	flagMountPoint = flag.String("mount", "", "if set, mount the filesystem at this path")
 	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
+	flagRepo       = flag.String("repo", "", "experimental: Git repository URL to export as /repos/<owner>/<repo>/<commit> over NFS. The <owner> and <repo> are inferred from the last 2 slash-separated segments")
+	flagCommit     = flag.String("commit", "", "experimental: full commit SHA to export from -repo")
 	portmapper     = flag.Bool("portmapper", false, "if set, run rpcbind portmapper on TCP+UDP port 111 (needed for Windows NFS clients). For NFS mode only")
 	flagWinFSP     = flag.Bool("winfsp", false, "if set, use WinFSP on Windows")
 
 	// TODO: ideally auto-detect and remove this flag.
 	flagNFSForWindows = flag.Bool("nfs-for-windows-clients", runtime.GOOS == "windows", "if set, alter NFS server behavior for Windows clients (TODO: ideally auto-detect and remove this flag)")
 )
+
+func repositoryName(remote string) (string, error) {
+	u, err := url.Parse(remote)
+	if err != nil {
+		return "", fmt.Errorf("invalid -repo URL %q: %w", remote, err)
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid -repo URL %q; want a path ending in owner/repo", remote)
+	}
+	parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".git")
+	return strings.Join(parts[len(parts)-2:], "/"), nil
+}
 
 func main() {
 	flag.Parse()
@@ -97,7 +118,36 @@ func main() {
 		}
 	}
 
-	nfsHandler := mfs.NFSHandler()
+	var nfsHandler nfs.Handler = mfs.NFSHandler()
+	if *flagRepo != "" || *flagCommit != "" {
+		if *flagNFS == "" || *flagRepo == "" || *flagCommit == "" {
+			log.Fatal("-repo and -commit require each other and -nfs")
+		}
+		name, err := repositoryName(*flagRepo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("os.UserHomeDir: %v", err)
+		}
+		manager := gitrepo.NewManager(filepath.Join(homeDir, ".cache", "gomodfs-repos"), map[string]gitrepo.Config{
+			name: {
+				RemoteURL: *flagRepo,
+			},
+		})
+		manager.RegisterMetrics(reg)
+		gfs, err := gitrepo.NewNFSHandler(manager, 0, 0)
+		if err != nil {
+			log.Fatal(err)
+		}
+		release, err := gfs.Acquire(context.Background(), name, *flagCommit)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer release()
+		nfsHandler = nfsexports.New(mfs, gfs)
+	}
 
 	if *debugListen != "" {
 		ln, err := net.Listen("tcp", *debugListen)

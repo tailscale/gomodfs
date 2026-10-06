@@ -186,4 +186,4 @@ jobs:
 
       - name: "verify used"
         run: |
-          go test -v ./testing/ci '-verify-used'
+          go test -v ./testing/ci '-verify-used' '-relative-open'

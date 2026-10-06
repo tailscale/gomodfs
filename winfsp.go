@@ -15,10 +15,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/tailscale/gomodfs/store"
 	"github.com/winfsp/go-winfsp"
 	"github.com/winfsp/go-winfsp/gofs"
 	"golang.org/x/sys/windows"
@@ -295,25 +295,30 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 	if err != nil {
 		return nil, err
 	}
-	spanGF := d.fs.Stats.StartSpan("fsp.OpenFile-GetFile")
-	contents, err := d.fs.Store.GetFile(ctx, mh, dp.Path)
+	fi, err := d.fs.Store.Stat(ctx, mh, dp.Path)
 	if err != nil {
-		if errors.Is(err, store.ErrIsDir) {
-			spanRD := d.fs.Stats.StartSpan("fsp.OpenFile-Readdir")
-			ents, err := d.fs.Store.Readdir(ctx, mh, dp.Path)
-			spanRD.End(err)
-			if err != nil {
-				spanGF.End(err)
-				return nil, err
-			}
-			spanGF.End(nil)
-			return wdDir{pathInZip: dp.Path, baseName: base, ents: ents}, nil
-		}
-		spanGF.End(err)
 		return nil, err
 	}
-	spanGF.End(nil)
-	return newFWPFileFromContents(name, contents), nil
+	if fi.IsDir() {
+		spanRD := d.fs.Stats.StartSpan("fsp.OpenFile-Readdir")
+		ents, err := d.fs.Store.Readdir(ctx, mh, dp.Path)
+		spanRD.End(err)
+		if err != nil {
+			return nil, err
+		}
+		return wdDir{pathInZip: dp.Path, baseName: base, ents: ents}, nil
+	}
+	// Get the contents on the first read, not now: Windows opens files for
+	// many things that don't read them, including every os.Stat.
+	return &winFSPRegularFile{
+		fi: regFileInfo{name: name, size: fi.Size()},
+		getContents: func() ([]byte, error) {
+			sp := d.fs.Stats.StartSpan("fsp.ReadAt-GetFile")
+			contents, err := d.fs.Store.GetFile(ctx, mh, dp.Path)
+			sp.End(err)
+			return contents, err
+		},
+	}, nil
 }
 
 func (s *winFSPRunner) Unmount() error {
@@ -350,8 +355,32 @@ func newFWPFileFromContents(baseName string, contents []byte) gofs.File {
 }
 
 type winFSPRegularFile struct {
-	fi       os.FileInfo
-	contents []byte
+	fi os.FileInfo
+
+	// getContents, if non-nil, returns the file's contents. It's called on
+	// the first ReadAt, and again on later ones until it succeeds.
+	getContents func() ([]byte, error)
+
+	mu       sync.Mutex
+	contents []byte // the contents, once known
+	haveData bool   // contents is valid
+}
+
+// data returns the file's contents, getting them first if needed.
+func (f *winFSPRegularFile) data() ([]byte, error) {
+	if f.getContents == nil {
+		return f.contents, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.haveData {
+		contents, err := f.getContents()
+		if err != nil {
+			return nil, err
+		}
+		f.contents, f.haveData = contents, true
+	}
+	return f.contents, nil
 }
 
 func (f *winFSPRegularFile) Close() error { return nil }
@@ -374,7 +403,11 @@ func (f *winFSPRegularFile) Read(p []byte) (n int, err error) {
 }
 
 func (f *winFSPRegularFile) ReadAt(p []byte, off int64) (n int, err error) {
-	n = copy(p, f.contents[min(off, int64(len(f.contents))):])
+	contents, err := f.data()
+	if err != nil {
+		return 0, err
+	}
+	n = copy(p, contents[min(off, int64(len(contents))):])
 	if n == 0 && len(p) > 0 {
 		return 0, io.EOF
 	}

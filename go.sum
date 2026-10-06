@@ -96,8 +96,8 @@ github.com/willscott/go-nfs v0.0.3 h1:Z5fHVxMsppgEucdkKBN26Vou19MtEM875NmRwj156R
 github.com/willscott/go-nfs v0.0.3/go.mod h1:VhNccO67Oug787VNXcyx9JDI3ZoSpqoKMT/lWMhUIDg=
 github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886 h1:DtrBtkgTJk2XGt4T7eKdKVkd9A5NCevN2e4inLXtsqA=
 github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886/go.mod h1:Tq++Lr/FgiS3X48q5FETemXiSLGuYMQT2sPjYNPJSwA=
-github.com/winfsp/go-winfsp v1.0.2 h1:s4GhoNbntucXbrqFhto40+0lThXqkeo3EzCdyiizcaM=
-github.com/winfsp/go-winfsp v1.0.2/go.mod h1:qiEMMy2t00UW5mpTgLbJeqVKkopN0lsYvOPtgj1mUv0=
+github.com/winfsp/go-winfsp v1.0.5 h1:6OzuuZjK4CJdWthMvvUBgQRl8Ye0bdTsZzyO8ocW5Gc=
+github.com/winfsp/go-winfsp v1.0.5/go.mod h1:aE+JiVxKhiHzrCTmmk1aB83aZv68JAQqUO+jni6q1Cg=
 github.com/xanzy/ssh-agent v0.3.3 h1:+/15pJfg/RsTxqYcX6fHqOXZwwMP+2VyYWJeWM2qQFM=
 github.com/xanzy/ssh-agent v0.3.3/go.mod h1:6dzNDKs0J9rVPHPhaGCukekBHKqfl+L3KghI1Bc68Uw=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=

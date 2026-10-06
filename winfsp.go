@@ -36,7 +36,13 @@ func (mfs *FS) MountWinFSP(mntPoint string) (MountRunner, error) {
 		},
 		mntPoint, // e.g. "M:"
 		winfsp.FileSystemName("gomodfs"),
-		winfsp.Attributes(winfsp.FspFSAttributeReadOnlyVolume),
+		// gomodfs paths are case-sensitive, like the GOMODCACHE layout it
+		// emulates (which escapes capitals as "!x"). Say so: on a volume
+		// that claims to be case-insensitive and not case-preserving,
+		// Windows passes relative opens to us with the working directory's
+		// path upcased, which we don't recognize.
+		winfsp.CaseSensitive(true),
+		winfsp.Attributes(winfsp.FspFSAttributeReadOnlyVolume|winfsp.FspFSAttributeCasePreservedNames),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("winfsp.Mount: %w", err)

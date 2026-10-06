@@ -314,7 +314,7 @@ func (pfs *fspFS) OpenFile(name string, flag int, perm os.FileMode) (retFile gof
 		fi: regFileInfo{name: name, size: fi.Size()},
 		getContents: func() ([]byte, error) {
 			sp := d.fs.Stats.StartSpan("fsp.ReadAt-GetFile")
-			contents, err := d.fs.Store.GetFile(ctx, mh, dp.Path)
+			contents, err := d.fs.getFileContents(ctx, dp.ModVersion, mh, dp.Path)
 			sp.End(err)
 			return contents, err
 		},

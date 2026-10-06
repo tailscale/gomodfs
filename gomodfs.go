@@ -104,6 +104,19 @@ type FS struct {
 	entCache  lru.Cache[handle, *readCacheEntry]
 	blobCache lru.Cache[blobHash, []byte]
 	blobCount map[blobHash]int // ref count of blobHash in entCache
+
+	// pathContentsMu guards pathContents.
+	pathContentsMu sync.Mutex
+	// pathContents caches file contents by path, for getFileContents. Its
+	// sizes are in bytes, and it's lazily set up with a MaxSize of
+	// GetFileCacheSize.
+	pathContents lru.Cache[pathContentsKey, []byte]
+}
+
+// pathContentsKey is the key of FS.pathContents.
+type pathContentsKey struct {
+	mv   store.ModuleVersion
+	path string // slash-separated path within the module
 }
 
 // GetStore returns the underlying store.Store.
@@ -112,6 +125,44 @@ func (fs *FS) GetStore() store.Store { return fs.Store }
 func (fs *FS) GetFileCacheSize() int64 {
 	const defaultFileCacheSize = 2 << 30
 	return cmp.Or(fs.FileCacheSize, defaultFileCacheSize)
+}
+
+// getFileContents returns the contents of the file at path in module
+// version mv, whose handle is mh.
+//
+// Unlike fs.Store.GetFile, it caches the contents, keeping up to
+// GetFileCacheSize bytes, for filesystems that read files by path. (NFS
+// caches by handle instead; see getFileContents on NFSHandler.) WinFsp
+// needs it because Windows drops a file's cached data once no process has
+// it open, so without this, each go command that read a file would get it
+// from the store again.
+func (fs *FS) getFileContents(ctx context.Context, mv store.ModuleVersion, mh store.ModHandle, path string) ([]byte, error) {
+	k := pathContentsKey{mv, path}
+	fs.pathContentsMu.Lock()
+	v, ok := fs.pathContents.GetOk(k)
+	fs.pathContentsMu.Unlock()
+	if ok {
+		fs.MetricFileContentCacheHit.Add(1)
+		return v, nil
+	}
+	fs.MetricFileContentCacheMiss.Add(1)
+
+	sp := fs.Stats.StartSpan("get-file-contents-miss")
+	v, err := fs.Store.GetFile(ctx, mh, path)
+	sp.End(err)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.MetricFileContentCacheFill.Add(1)
+	fs.pathContentsMu.Lock()
+	defer fs.pathContentsMu.Unlock()
+	if fs.pathContents.EntrySize == nil {
+		fs.pathContents.EntrySize = func(_ pathContentsKey, v []byte) int64 { return int64(len(v)) }
+		fs.pathContents.MaxSize = fs.GetFileCacheSize()
+	}
+	fs.pathContents.Set(k, v)
+	return v, nil
 }
 
 func hashModVersion(mv store.ModuleVersion) (ret modVerHash) {

@@ -54,8 +54,24 @@ func (s *Store) client() *http.Client {
 	if s.Client != nil {
 		return s.Client
 	}
-	return http.DefaultClient
+	return defaultClient()
 }
+
+// maxIdleConnsPerHost is how many idle connections to the server the
+// default client keeps. It should be at least the number of concurrent
+// requests (one per WinFsp dispatcher thread, which is one per CPU).
+const maxIdleConnsPerHost = 64
+
+// defaultClient is the client used when Store.Client is nil.
+//
+// Unlike http.DefaultClient, which keeps only 2 idle connections per host,
+// it keeps enough for concurrent requests to reuse them rather than open
+// a new connection per file.
+var defaultClient = sync.OnceValue(func() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	return &http.Client{Transport: tr}
+})
 
 // remoteModHandle is the ModHandle returned by GetZipRoot. It holds
 // the parsed modmap (file metadata) and derived directory entries.

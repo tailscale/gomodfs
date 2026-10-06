@@ -4,13 +4,61 @@
 package remotestore
 
 import (
+	"context"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tailscale/gomodfs/store"
 )
+
+// TestDefaultClientReusesConns tests that concurrent requests from a Store
+// with the default client reuse connections rather than dialing one per
+// request. On Windows, the closed connections otherwise linger in
+// TIME_WAIT and exhaust the ephemeral ports.
+func TestDefaultClientReusesConns(t *testing.T) {
+	var newConns atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("module example.com/m\n"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	s := &Store{BaseURL: srv.URL}
+	mv := store.ModuleVersion{Module: "example.com/m", Version: "v1.0.0"}
+	const goroutines, reqsEach = 32, 20
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range reqsEach {
+				if _, err := s.GetModFile(context.Background(), mv); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	// The initial burst can dial a few spares, as a request waiting for a
+	// connection dials even if another one frees up first. Without reuse,
+	// it's about one connection per 3 requests.
+	const max = 2 * goroutines
+	if got := newConns.Load(); got > max {
+		t.Errorf("%d requests from %d goroutines dialed %d connections; want at most %d",
+			goroutines*reqsEach, goroutines, got, max)
+	}
+}
 
 func TestBuildDirMap(t *testing.T) {
 	tests := []struct {

@@ -5,11 +5,14 @@ package remotestore
 
 import (
 	"context"
+	"errors"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +60,65 @@ func TestDefaultClientReusesConns(t *testing.T) {
 	if got := newConns.Load(); got > max {
 		t.Errorf("%d requests from %d goroutines dialed %d connections; want at most %d",
 			goroutines*reqsEach, goroutines, got, max)
+	}
+}
+
+// TestMetaFileCache tests that a Store fetches each metadata file from
+// the server once, even when asked concurrently, and doesn't cache misses.
+func TestMetaFileCache(t *testing.T) {
+	var mu sync.Mutex
+	reqs := map[string]int{} // URL path -> requests
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs[r.URL.Path]++
+		mu.Unlock()
+		if strings.Contains(r.URL.Path, "/missing/") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte("contents of " + r.URL.Path))
+	}))
+	defer srv.Close()
+
+	s := &Store{BaseURL: srv.URL}
+	ctx := context.Background()
+	mv := store.ModuleVersion{Module: "example.com/m", Version: "v1.0.0"}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			for range 5 {
+				mod, err := s.GetModFile(ctx, mv)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if want := "contents of " + metaPrefix + "example.com/m/@v/v1.0.0.mod"; string(mod) != want {
+					t.Errorf("GetModFile = %q; want %q", mod, want)
+				}
+				if _, err := s.GetInfoFile(ctx, mv); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	missing := store.ModuleVersion{Module: "example.com/missing", Version: "v1.0.0"}
+	for range 2 {
+		if _, err := s.GetModFile(ctx, missing); !errors.Is(err, store.ErrCacheMiss) {
+			t.Errorf("GetModFile(missing) error = %v; want ErrCacheMiss", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := map[string]int{
+		metaPrefix + "example.com/m/@v/v1.0.0.mod":       1,
+		metaPrefix + "example.com/m/@v/v1.0.0.info":      1,
+		metaPrefix + "example.com/missing/@v/v1.0.0.mod": 2,
+	}
+	if !maps.Equal(reqs, want) {
+		t.Errorf("server requests = %v; want %v", reqs, want)
 	}
 }
 

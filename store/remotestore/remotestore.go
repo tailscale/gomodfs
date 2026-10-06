@@ -36,7 +36,15 @@ type Store struct {
 
 	mu      sync.Mutex
 	modmaps map[store.ModuleVersion]*remoteModHandle // cached modmap per MV
+	meta    map[metaKey][]byte                       // cached .info, .mod and .ziphash files
 	tmpDir  string                                   // lazy-created temp dir for large files
+}
+
+// metaKey is the key of a cached metadata file: ext is "info", "mod" or
+// "ziphash".
+type metaKey struct {
+	mv  store.ModuleVersion
+	ext string
 }
 
 // Close cleans up temporary files. It should be called when the store is no longer needed.
@@ -274,7 +282,40 @@ func (s *Store) GetZipHash(ctx context.Context, h store.ModHandle) ([]byte, erro
 	return s.getMetaFile(ctx, rmh.mv, "ziphash")
 }
 
+// getMetaFile returns the metadata file with extension ext for mv.
+//
+// Metadata files never change for a module version, and the go command
+// reads hundreds of them per invocation (each stat and open of one is a
+// call here), so they're cached for the life of the Store. Misses aren't
+// cached, as the server may get the module later.
 func (s *Store) getMetaFile(ctx context.Context, mv store.ModuleVersion, ext string) ([]byte, error) {
+	k := metaKey{mv, ext}
+	s.mu.Lock()
+	v, ok := s.meta[k]
+	s.mu.Unlock()
+	if ok {
+		return v, nil
+	}
+	vi, err, _ := s.sf.Do("meta:"+mv.Module+"@"+mv.Version+"."+ext, func() (any, error) {
+		v, err := s.fetchMetaFile(ctx, mv, ext)
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.meta == nil {
+			s.meta = make(map[metaKey][]byte)
+		}
+		s.meta[k] = v
+		return v, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return vi.([]byte), nil
+}
+
+func (s *Store) fetchMetaFile(ctx context.Context, mv store.ModuleVersion, ext string) ([]byte, error) {
 	escaped, err := mvToEscapedPath(mv)
 	if err != nil {
 		return nil, err

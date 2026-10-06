@@ -15,6 +15,7 @@ import (
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/tailscale/gomodfs/store"
+	"tailscale.com/util/lru"
 )
 
 // FSBackend is the interface the handler needs from the gomodfs.FS type.
@@ -37,6 +38,7 @@ func Handler(backend FSBackend) http.Handler {
 		backend: backend,
 		store:   backend.GetStore(),
 	}
+	h.modmapLZ.MaxEntries = maxCachedModMaps
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/modmap/", h.handleModMap)
 	mux.HandleFunc("GET /api/v1/file/", h.handleFile)
@@ -49,8 +51,14 @@ type handler struct {
 	store   store.Store
 
 	mu       sync.Mutex
-	modmapLZ map[store.ModuleVersion][]byte // cached lz4-compressed modmap JSON
+	modmapLZ lru.Cache[store.ModuleVersion, []byte] // cached lz4-compressed modmap JSON
 }
+
+// maxCachedModMaps bounds the handler's cache of compressed modmaps, which
+// otherwise grows with every module version ever served by a long-running
+// server. A modmap is typically a few KB to a few hundred KB compressed, and
+// a cache miss only costs walking the store again.
+const maxCachedModMaps = 256
 
 func (h *handler) handleModMap(w http.ResponseWriter, r *http.Request) {
 	mv, _, err := parseMVFromPath(r.URL.Path, modmapPrefix)
@@ -66,7 +74,7 @@ func (h *handler) handleModMap(w http.ResponseWriter, r *http.Request) {
 
 	// Check cache for pre-compressed response.
 	h.mu.Lock()
-	cached := h.modmapLZ[mv]
+	cached := h.modmapLZ.Get(mv)
 	h.mu.Unlock()
 	if cached != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -117,10 +125,7 @@ func (h *handler) handleModMap(w http.ResponseWriter, r *http.Request) {
 
 	// Cache the compressed bytes.
 	h.mu.Lock()
-	if h.modmapLZ == nil {
-		h.modmapLZ = make(map[store.ModuleVersion][]byte)
-	}
-	h.modmapLZ[mv] = compressed
+	h.modmapLZ.Set(mv, compressed)
 	h.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")

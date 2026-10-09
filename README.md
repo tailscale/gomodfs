@@ -61,6 +61,23 @@ Future implementations of the storage interface might include:
 * traditional GOMODCACHE on-disk layout
 * S3/etc object storage
 
+# Experimental Git checkouts
+
+`gomodfs -repo <remote> -commit <full-SHA-1>` serves a read-only checkout of the
+commit at `/repos/<owner>/<repo>` over NFSv4.1, on a listener set by
+`-repo-nfs` (default `localhost:2050`) that is separate from the module cache's
+NFSv3 listener. The server has no authentication, so give `-repo-nfs` an
+address on another interface only on a trusted network.
+
+    # Linux
+    mount -t nfs -o vers=4.1,port=2050,ro 127.0.0.1:/repos/<owner>/<repo> /mnt/checkout
+    # macOS
+    mount -t nfs -o vers=4.1,port=2050,rdonly,rsize=1048576 127.0.0.1:/repos/<owner>/<repo> /mnt/checkout
+
+The checkout has a read-only `.git` directory with the loose objects of the
+commit, so read-only Git commands such as `git status` and `git log` work. See
+package `gitrepo` to serve checkouts from another program.
+
 # Status
 
 As of 2025-07-27, this is still all very new. Use with caution. It's starting to

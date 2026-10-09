@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"syscall"
@@ -51,6 +52,26 @@ func main() {
 		if runtime.GOOS == "windows" {
 			cmd.Args = append(cmd.Args, "-portmapper")
 		}
+	}
+
+	// The Windows NFS client does not support NFSv4.1, so only Linux and
+	// macOS mount the Git checkout.
+	if runtime.GOOS != "windows" {
+		dir, err := os.MkdirTemp("", "gomodfs-repo-fixture-")
+		if err != nil {
+			log.Fatal(err)
+		}
+		repoDir := filepath.Join(dir, "example", "repo")
+		if err := os.MkdirAll(repoDir, 0755); err != nil {
+			log.Fatal(err)
+		}
+		commit, err := createRepoFixture(repoDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// nfsmount can mount from an IP address that is not a loopback
+		// address, so listen on all interfaces, like -nfs.
+		cmd.Args = append(cmd.Args, "-repo=file://"+filepath.ToSlash(repoDir), "-commit="+commit, "-repo-nfs=:2050")
 	}
 
 	cmd.Stdout = f

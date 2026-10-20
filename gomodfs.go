@@ -38,6 +38,7 @@ import (
 	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/sync/singleflight"
 	"tailscale.com/types/result"
+	"tailscale.com/util/set"
 	"tailscale.com/util/testenv"
 )
 
@@ -335,9 +336,51 @@ func (fs *FS) downloadZip(ctx context.Context, mv store.ModuleVersion) (store.Mo
 			zf:   f,
 		})
 	}
+	if mv.Module == toolchainModule {
+		put.Files = addToolchainGoMods(put.Files)
+	}
 
 	return fs.Store.PutModule(ctx, mv, put)
 }
+
+// toolchainModule is the module path of the Go toolchain zips that cmd/go
+// downloads for GOTOOLCHAIN switching. See https://go.dev/doc/toolchain.
+const toolchainModule = "golang.org/toolchain"
+
+// addToolchainGoMods returns files with a "go.mod" copy added beside
+// each "_go.mod" file that lacks one.
+//
+// Toolchain zips ship their go.mod files renamed to _go.mod (so the module
+// zip doesn't contain nested modules), and after downloading a toolchain,
+// cmd/go copies each _go.mod back to go.mod in the module cache. That
+// requires making module cache directories writable, which fails on our
+// read-only filesystem. But cmd/go skips that step if src/go.mod already
+// exists with the same size as src/_go.mod, so we provide the copies
+// ourselves.
+func addToolchainGoMods(files []store.PutFile) []store.PutFile {
+	have := set.Set[string]{}
+	for _, f := range files {
+		have.Add(f.Path())
+	}
+	for _, f := range files {
+		dir, ok := strings.CutSuffix(f.Path(), "_go.mod")
+		if !ok || (dir != "" && !strings.HasSuffix(dir, "/")) {
+			continue
+		}
+		if !have.Contains(dir + "go.mod") {
+			files = append(files, renamedPutFile{f, dir + "go.mod"})
+		}
+	}
+	return files
+}
+
+// renamedPutFile is a PutFile with a different path.
+type renamedPutFile struct {
+	store.PutFile
+	path string
+}
+
+func (f renamedPutFile) Path() string { return f.path }
 
 // downloadZipSet downloads a module version's zip, info, and mod
 // files from the module proxy URL prefix baseURL.
@@ -463,6 +506,13 @@ func (fs *FS) getZipRoot(ctx context.Context, mv store.ModuleVersion) (mh store.
 		}
 
 		root, err := fs.Store.GetZipRoot(ctx, mv)
+		if err == nil && mv.Module == toolchainModule && !fs.ReadOnly {
+			// Toolchains stored before addToolchainGoMods existed lack
+			// the go.mod copies that cmd/go needs. Re-download them.
+			if _, serr := fs.Store.Stat(ctx, root, "src/go.mod"); errors.Is(serr, os.ErrNotExist) {
+				err = store.ErrCacheMiss
+			}
+		}
 		if err == nil {
 			fs.setZipRootCache(mv, root)
 			return root, nil

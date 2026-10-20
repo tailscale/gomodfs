@@ -5,8 +5,10 @@ package gomodfs
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -180,5 +182,34 @@ func TestModuleProxyURLs(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+type fakePutFile string
+
+func (f fakePutFile) Path() string                 { return string(f) }
+func (f fakePutFile) Mode() os.FileMode            { return 0644 }
+func (f fakePutFile) Size() int64                  { return 0 }
+func (f fakePutFile) Open() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("")), nil }
+
+func TestAddToolchainGoMods(t *testing.T) {
+	var in []store.PutFile
+	for _, p := range []string{
+		"_go.mod",
+		"src/_go.mod",
+		"src/cmd/_go.mod",
+		"src/cmd/go.mod", // already present; no copy added
+		"src/foo/x_go.mod",
+		"src/main.go",
+	} {
+		in = append(in, fakePutFile(p))
+	}
+	var got []string
+	for _, f := range addToolchainGoMods(in)[len(in):] {
+		got = append(got, f.Path())
+	}
+	want := []string{"go.mod", "src/go.mod"}
+	if !slices.Equal(got, want) {
+		t.Errorf("added %q; want %q", got, want)
 	}
 }

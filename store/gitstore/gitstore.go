@@ -215,6 +215,7 @@ func (d *Storage) runCatFileBatch() (err error) {
 		}
 		hash, objType := f[0], f[1]
 		if objType == "missing" {
+			sp.End(nil)
 			req.res <- objResponse{err: errMissing}
 			continue
 		}

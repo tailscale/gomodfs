@@ -5,19 +5,25 @@ package ci
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"encoding/json"
 	"flag"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/tailscale/gomodfs"
 )
 
 var (
-	runVerifyUsed   = flag.Bool("verify-used", false, "if set, runs TestVerifyUsed")
-	runRelativeOpen = flag.Bool("relative-open", false, "if set, runs TestRelativeOpen against the mounted $GOMODCACHE")
+	runVerifyUsed      = flag.Bool("verify-used", false, "if set, runs TestVerifyUsed")
+	runRelativeOpen    = flag.Bool("relative-open", false, "if set, runs TestRelativeOpen against the mounted $GOMODCACHE")
+	runRepositoryMount = flag.Bool("repository-mount", false, "verify the CI NFS repository mount")
 )
 
 // TestRelativeOpen opens files in the mounted module cache by paths relative
@@ -83,4 +89,60 @@ func TestVerifyUsed(t *testing.T) {
 	}
 
 	// TODO: gracefully shut down the server? meh. CI will clean up.
+}
+
+func TestRepositoryMount(t *testing.T) {
+	if !*runRepositoryMount {
+		t.Skip("only runs in CI with -repository-mount")
+	}
+	dir := os.Getenv("GOMODFS_REPO")
+	if dir == "" {
+		t.Fatal("GOMODFS_REPO must be the mounted fixture")
+	}
+	// The example server's fixed owner needn't match the CI runner.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "safe.directory")
+	t.Setenv("GIT_CONFIG_VALUE_0", dir)
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %q: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := git("status", "--porcelain"); got != "" {
+		t.Errorf("dirty checkout: %s", got)
+	}
+	if got := git("log", "--format=%s"); got != "NFS repository fixture" {
+		t.Errorf("git log = %q", got)
+	}
+	info, err := os.Stat(filepath.Join(dir, "run.sh"))
+	if err != nil || info.Mode()&0111 == 0 {
+		t.Errorf("mounted executable mode: %v, %v", info, err)
+	}
+	if target, err := os.Readlink(filepath.Join(dir, "main.link")); err != nil || target != "main.go" {
+		t.Errorf("mounted symlink = %q, %v", target, err)
+	}
+	if f, err := os.OpenFile(filepath.Join(dir, "main.go"), os.O_WRONLY|os.O_APPEND, 0); err == nil {
+		f.Close()
+		t.Error("opened main.go for writing on read-only checkout")
+	}
+
+	binary := filepath.Join(t.TempDir(), "fixture.exe")
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-buildvcs=true", "-o", binary, ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=", "GOTOOLCHAIN=local")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	bi, err := buildinfo.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(bi.Settings, debug.BuildSetting{Key: "vcs.modified", Value: "false"}) {
+		t.Errorf("build settings %v; want vcs.modified=false", bi.Settings)
+	}
 }

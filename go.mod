@@ -1,6 +1,6 @@
 module github.com/tailscale/gomodfs
 
-go 1.25.1
+go 1.27.1
 
 require (
 	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
@@ -12,6 +12,7 @@ require (
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
+	github.com/tailscale/nfsv4 v0.0.0-20261009101149-867c8548497d
 	github.com/willscott/go-nfs v0.0.3
 	github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886
 	github.com/winfsp/go-winfsp v1.0.5

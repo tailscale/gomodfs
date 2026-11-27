@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -21,8 +22,15 @@ import (
 )
 
 func main() {
+	repo := flag.Bool("repo", false, "mount the Git checkout that startgomodfs serves over NFSv4.1 instead of the module cache")
+	flag.Parse()
 	if os.Getenv("CI") != "true" {
 		log.Fatalf("startgomodfs is only intended to be run in CI")
+	}
+
+	export, mountName, envName, port := "/gomodfs", "gomodfs-mnt", "GOMODCACHE", 2049
+	if *repo {
+		export, mountName, envName, port = "/repos/example/repo", "gomodfs-repo-mnt", "GOMODFS_REPO", 2050
 	}
 
 	var cmd *exec.Cmd
@@ -30,7 +38,7 @@ func main() {
 	var machineIP = "127.0.0.1"
 
 	useTempMnt := func() {
-		mntDir = filepath.Join(os.TempDir(), "gomodfs-mnt")
+		mntDir = filepath.Join(os.TempDir(), mountName)
 		if err := os.MkdirAll(mntDir, 0755); err != nil {
 			log.Fatalf("creating mount dir %s: %v", mntDir, err)
 		}
@@ -66,7 +74,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var d net.Dialer
-		conn, err := d.DialContext(ctx, "tcp", "127.0.0.1:2049")
+		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err != nil {
 			return fmt.Errorf("NFS dial error: %v", err)
 		}
@@ -91,18 +99,26 @@ func main() {
 			mntDir)
 	case "linux":
 		useTempMnt()
+		opts := linuxNFSMountOpts(2049)
+		if *repo {
+			opts = fmt.Sprintf("vers=4.1,port=%d,ro", port)
+		}
 		cmd = exec.Command("sudo", "/usr/bin/mount",
 			"-t", "nfs",
-			"-o", linuxNFSMountOpts(2049),
-			machineIP+":/gomodfs",
+			"-o", opts,
+			machineIP+":"+export,
 			mntDir,
 		)
 	case "darwin":
 		useTempMnt()
+		opts := darwinNFSMountOpts(2049)
+		if *repo {
+			opts = fmt.Sprintf("vers=4.1,port=%d,rdonly,rsize=1048576", port)
+		}
 		cmd = exec.Command("/sbin/mount",
 			"-t", "nfs",
-			"-o", darwinNFSMountOpts(2049),
-			machineIP+":/gomodfs",
+			"-o", opts,
+			machineIP+":"+export,
 			mntDir,
 		)
 	default:
@@ -163,11 +179,11 @@ func main() {
 		if runtime.GOOS == "windows" && strings.HasSuffix(mcDir, ":") {
 			mcDir += "\\"
 		}
-		err := appendFile(e, fmt.Appendf(nil, "GOMODCACHE=%s\n", mcDir), 0644)
+		err := appendFile(e, fmt.Appendf(nil, "%s=%s\n", envName, mcDir), 0644)
 		if err != nil {
-			log.Fatalf("writing GOMODFS to GITHUB_ENV file %q: %v", e, err)
+			log.Fatalf("writing %s to GITHUB_ENV file %q: %v", envName, e, err)
 		}
-		log.Printf("set env GOMODCACHE=%s", mcDir)
+		log.Printf("set env %s=%s", envName, mcDir)
 	}
 }
 

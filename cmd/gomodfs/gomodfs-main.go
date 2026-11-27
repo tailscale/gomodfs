@@ -7,25 +7,31 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/bradfitz/parentdeath"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tailscale/gomodfs"
+	"github.com/tailscale/gomodfs/gitrepo"
 	"github.com/tailscale/gomodfs/stats"
 	"github.com/tailscale/gomodfs/store/gitstore"
 	"github.com/tailscale/gomodfs/store/remotestore"
 	"github.com/tailscale/gomodfs/temp-dev-fork/willscott/go-nfs"
+	"github.com/tailscale/nfsv4"
 )
 
 var (
@@ -35,6 +41,9 @@ var (
 	flagNFS        = flag.String("nfs", "", "if set, listen on this port for NFS requests")
 	flagMountPoint = flag.String("mount", "", "if set, mount the filesystem at this path")
 	flagMemLimitMB = flag.Int64("mem-limit-mb", 0, "how many megabytes (MiB) of memory gomodfs can use to store file contents in memory; 0 means to use a default")
+	flagRepo       = flag.String("repo", "", "experimental: Git repository URL or scp-style [user@]host:path remote to serve as /repos/<owner>/<repo> over NFSv4.1. The <owner> and <repo> are inferred from the last 2 slash-separated segments of the path")
+	flagCommit     = flag.String("commit", "", "experimental: full commit SHA to serve from -repo")
+	flagRepoNFS    = flag.String("repo-nfs", "localhost:2050", "NFSv4.1 listen address for -repo, separate from the module cache's -nfs listener. The server has no authentication, so listen on other interfaces only on trusted networks")
 	portmapper     = flag.Bool("portmapper", false, "if set, run rpcbind portmapper on TCP+UDP port 111 (needed for Windows NFS clients). For NFS mode only")
 	flagWinFSP     = flag.Bool("winfsp", false, "if set, use WinFSP on Windows")
 
@@ -44,6 +53,30 @@ var (
 	flagRemoteStore   = flag.String("remote-store", "", "if set, use a remote HTTP store at this URL instead of local git store")
 	flagServeStoreAPI = flag.String("serve-store-api", "", "if set, serve the store API on this address (e.g. :8090)")
 )
+
+// repositoryName returns the "owner/repo" name of the Git remote, from the
+// last two segments of its path. The remote is a URL, an scp-style
+// "[user@]host:path" remote, or a local path.
+func repositoryName(remote string) (string, error) {
+	p := remote
+	if strings.Contains(remote, "://") {
+		u, err := url.Parse(remote)
+		if err != nil {
+			return "", fmt.Errorf("invalid -repo URL %q: %w", remote, err)
+		}
+		p = u.Path
+	} else if host, rest, ok := strings.Cut(remote, ":"); ok && !strings.Contains(host, "/") {
+		// Like Git, use the scp-style syntax only if there is no slash
+		// before the first colon.
+		p = rest
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid -repo remote %q; want a path ending in owner/repo", remote)
+	}
+	parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".git")
+	return strings.Join(parts[len(parts)-2:], "/"), nil
+}
 
 func main() {
 	flag.Parse()
@@ -120,7 +153,55 @@ func main() {
 		}
 	}
 
-	nfsHandler := mfs.NFSHandler()
+	if (*flagRepo == "") != (*flagCommit == "") {
+		log.Fatal("-repo and -commit must be specified together")
+	}
+	if *flagRepo != "" {
+		name, err := repositoryName(*flagRepo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("os.UserHomeDir: %v", err)
+		}
+		manager, err := gitrepo.NewManager(filepath.Join(homeDir, ".cache", "gomodfs-repos"), map[gitrepo.RepoName]gitrepo.Config{
+			gitrepo.RepoName(name): {
+				RemoteURL: *flagRepo,
+			},
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer manager.Close()
+		manager.RegisterMetrics(reg)
+		co, err := manager.Checkout(context.Background(), gitrepo.RepoName(name), *flagCommit)
+		if err != nil {
+			log.Fatal(err)
+		}
+		repoFS, err := gitrepo.NewFS(gitrepo.FSOptions{
+			Checkouts: []*gitrepo.Checkout{co},
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		repoSrv := &nfsv4.Server{
+			FS:   repoFS,
+			Logf: log.Printf,
+		}
+		if *verbose {
+			repoSrv.Debugf = log.Printf
+		}
+		ln, err := net.Listen("tcp", *flagRepoNFS)
+		if err != nil {
+			log.Fatalf("Failed to listen on Git NFSv4 port %s: %v", *flagRepoNFS, err)
+		}
+		addr := ln.Addr().(*net.TCPAddr)
+		log.Printf("Git NFSv4.1 server listening at %s; to mount:\n\tmount -t nfs -o vers=4.1,port=%d,ro %s:/repos/%s /mnt/checkout", addr, addr.Port, addr.IP, name)
+		go func() {
+			log.Fatalf("Git NFSv4 server: %v", repoSrv.Serve(ln))
+		}()
+	}
 
 	if *debugListen != "" {
 		ln, err := net.Listen("tcp", *debugListen)
@@ -182,7 +263,7 @@ func main() {
 			log.Printf("To mount:\n\t mount -o port=%d,mountport=%d,vers=3,tcp,locallocks,soft -r -t nfs localhost:/ $HOME/mnt-gomodfs", port, port)
 		}
 		nfsSrv := &nfs.Server{
-			Handler:           nfsHandler,
+			Handler:           mfs.NFSHandler(),
 			ForWindowsClients: *flagNFSForWindows,
 		}
 		go nfsSrv.Serve(ln)

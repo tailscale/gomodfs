@@ -93,6 +93,9 @@ func (fs *FS) getTailscaleGoRoot(ctx context.Context, goos, goarch, commitHash s
 	if !errors.Is(err, store.ErrCacheMiss) {
 		return mv, nil, err
 	}
+	if fs.ReadOnly {
+		return mv, nil, store.ErrCacheMiss
+	}
 
 	// Cache fill.
 

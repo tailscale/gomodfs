@@ -4,6 +4,7 @@
 package gomodfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -211,5 +212,27 @@ func TestAddToolchainGoMods(t *testing.T) {
 	want := []string{"go.mod", "src/go.mod"}
 	if !slices.Equal(got, want) {
 		t.Errorf("added %q; want %q", got, want)
+	}
+}
+
+func TestTailscaleGoReadOnly(t *testing.T) {
+	st := &gitstore.Storage{GitRepo: testGitDir(t)}
+	addStopGitStoreCleanup(t, st)
+	tr := &hostRecordingTransport{inner: testDataTransport{}}
+	fs := &FS{
+		Store:    st,
+		Client:   &http.Client{Transport: tr},
+		ReadOnly: true,
+		Logf:     t.Logf,
+	}
+	mv := store.ModuleVersion{
+		Module:  "github.com/tailscale/go",
+		Version: "tsgo-linux-amd64-1cd3bf1a6eaf559aa8c00e749289559c884cef09",
+	}
+	if _, err := fs.getZipRoot(t.Context(), mv); !errors.Is(err, store.ErrCacheMiss) {
+		t.Errorf("getZipRoot on a cache miss with ReadOnly: err = %v; want ErrCacheMiss", err)
+	}
+	if len(tr.hosts) != 0 {
+		t.Errorf("ReadOnly FS made requests to %v; want none", tr.hosts)
 	}
 }
